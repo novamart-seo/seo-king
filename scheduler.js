@@ -54,9 +54,13 @@ app.get('/health', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🌐 SEO King Web Server running on port ${PORT}`);
   startScheduler();
+});
+
+server.on('error', (err) => {
+  console.error('Server error:', err);
 });
 
 // Schedule configuration
