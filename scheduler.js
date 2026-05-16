@@ -1,37 +1,62 @@
 require('dotenv').config();
 const { execSync } = require('child_process');
+const express = require('express');
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+// Keep alive endpoint
+app.get('/', (req, res) => {
+  res.json({
+    status: '✅ SEO King is running',
+    timestamp: new Date().toISOString(),
+    schedule: {
+      dailyFix: 'Every day at 2:00 AM',
+      redirectCheck: 'Every day at 2:30 AM',
+      brokenLinks: 'Every Monday at 3:00 AM',
+      imageOptimization: 'Every Sunday at 4:00 AM'
+    }
+  });
+});
+
+// Webhook endpoint for new products
+app.post('/webhook/product-created', async (req, res) => {
+  console.log('\n🔔 New product webhook received!');
+  const product = req.body;
+  console.log(`Product: ${product.title}`);
+  res.json({ received: true });
+
+  // Run auto fix for new product
+  try {
+    console.log('Running SEO fix for new product...');
+    execSync('node autoFix.js', { stdio: 'inherit' });
+    console.log('✅ SEO fix complete for new product');
+  } catch (error) {
+    console.error('❌ SEO fix failed:', error.message);
+  }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', uptime: process.uptime() });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`\n🌐 SEO King Web Server running on port ${PORT}`);
+  startScheduler();
+});
 
 // Schedule configuration
 const SCHEDULE = {
-  // Run full SEO audit and fix every day at 2:00 AM
-  dailyFix: {
-    hour: 2,
-    minute: 0,
-    task: 'autoFix'
-  },
-  // Run broken link checker every Monday at 3:00 AM
-  weeklyBrokenLinks: {
-    dayOfWeek: 1, // Monday
-    hour: 3,
-    minute: 0,
-    task: 'brokenLinks'
-  },
-  // Run redirect manager every day at 2:30 AM
-  dailyRedirects: {
-    hour: 2,
-    minute: 30,
-    task: 'redirectManager'
-  },
-  // Run technical SEO (images) every Sunday at 4:00 AM
-  weeklyTechnicalSEO: {
-    dayOfWeek: 0, // Sunday
-    hour: 4,
-    minute: 0,
-    task: 'technicalSEO'
-  }
+  dailyFix: { hour: 2, minute: 0 },
+  dailyRedirects: { hour: 2, minute: 30 },
+  weeklyBrokenLinks: { dayOfWeek: 1, hour: 3, minute: 0 },
+  weeklyTechnicalSEO: { dayOfWeek: 0, hour: 4, minute: 0 }
 };
 
-// Run a task
 function runTask(taskName) {
   const timestamp = new Date().toISOString();
   console.log(`\n[${timestamp}] 🚀 Running task: ${taskName}`);
@@ -43,14 +68,11 @@ function runTask(taskName) {
   }
 }
 
-// Check if a daily task should run
 function shouldRunDaily(schedule) {
   const now = new Date();
-  return now.getHours() === schedule.hour &&
-    now.getMinutes() === schedule.minute;
+  return now.getHours() === schedule.hour && now.getMinutes() === schedule.minute;
 }
 
-// Check if a weekly task should run
 function shouldRunWeekly(schedule) {
   const now = new Date();
   return now.getDay() === schedule.dayOfWeek &&
@@ -58,7 +80,6 @@ function shouldRunWeekly(schedule) {
     now.getMinutes() === schedule.minute;
 }
 
-// Main scheduler loop
 function startScheduler() {
   console.log('\n🕐 SEO King Scheduler Started');
   console.log('================================');
@@ -69,32 +90,14 @@ function startScheduler() {
   console.log('  📅 Image optimization — every Sunday at 4:00 AM');
   console.log('================================\n');
 
-  // Check every minute
   setInterval(() => {
     const now = new Date();
     console.log(`⏰ ${now.toLocaleTimeString()} — Scheduler running...`);
 
-    // Daily fix
-    if (shouldRunDaily(SCHEDULE.dailyFix)) {
-      runTask('autoFix');
-    }
+    if (shouldRunDaily(SCHEDULE.dailyFix)) runTask('autoFix');
+    if (shouldRunDaily(SCHEDULE.dailyRedirects)) runTask('redirectManager');
+    if (shouldRunWeekly(SCHEDULE.weeklyBrokenLinks)) runTask('brokenLinks');
+    if (shouldRunWeekly(SCHEDULE.weeklyTechnicalSEO)) runTask('technicalSEO');
 
-    // Daily redirect check
-    if (shouldRunDaily(SCHEDULE.dailyRedirects)) {
-      runTask('redirectManager');
-    }
-
-    // Weekly broken links
-    if (shouldRunWeekly(SCHEDULE.weeklyBrokenLinks)) {
-      runTask('brokenLinks');
-    }
-
-    // Weekly technical SEO
-    if (shouldRunWeekly(SCHEDULE.weeklyTechnicalSEO)) {
-      runTask('technicalSEO');
-    }
-
-  }, 60000); // Check every 60 seconds
+  }, 60000);
 }
-
-startScheduler();
