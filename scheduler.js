@@ -23,18 +23,28 @@ app.get('/', (req, res) => {
 
 // Webhook endpoint for new products
 app.post('/webhook/product-created', async (req, res) => {
-  console.log('\n🔔 New product webhook received!');
-  const product = req.body;
-  console.log(`Product: ${product.title}`);
-  res.json({ received: true });
-
-  // Run auto fix for new product
   try {
-    console.log('Running SEO fix for new product...');
-    execSync('node autoFix.js', { stdio: 'inherit' });
-    console.log('✅ SEO fix complete for new product');
+    console.log('\n🔔 New product webhook received!');
+    const product = req.body;
+    console.log(`Product: ${product.title || 'Unknown'}`);
+
+    // Respond immediately to Shopify — prevents 502
+    res.status(200).json({ received: true });
+
+    // Run fix in background after responding
+    setTimeout(() => {
+      try {
+        console.log('Running SEO fix for new product...');
+        execSync('node autoFix.js', { stdio: 'inherit', timeout: 300000 });
+        console.log('✅ SEO fix complete for new product');
+      } catch (error) {
+        console.error('❌ SEO fix failed:', error.message);
+      }
+    }, 1000);
+
   } catch (error) {
-    console.error('❌ SEO fix failed:', error.message);
+    console.error('Webhook error:', error.message);
+    res.status(200).json({ received: true });
   }
 });
 
