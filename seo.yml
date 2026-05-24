@@ -1,0 +1,112 @@
+name: SEO King Automation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'   # Every 30 min — new product checker
+    - cron: '0 21 * * *'     # 2:00 AM PKT — seo autofix
+    - cron: '30 21 * * *'    # 2:30 AM PKT — redirects
+    - cron: '0 22 * * *'     # 3:00 AM PKT — seo patterns
+    - cron: '30 22 * * 1'    # 3:30 AM PKT Monday — broken links
+    - cron: '0 23 * * 0'     # 4:00 AM PKT Sunday — technical seo
+
+env:
+  SHOPIFY_STORE_URL:    ${{ secrets.SHOPIFY_STORE_URL }}
+  SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+  GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+  GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
+
+jobs:
+
+  # ── Every 30 min: Poll & instantly fix new products ────────────────────────
+  new-product-check:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.event.schedule == '*/30 * * * *')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Poll Shopify & fix new products
+        run: node pollAndFix.js
+
+      - name: Upload SEO reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: new-product-reports-${{ github.run_id }}
+          path: seo-reports/
+          retention-days: 30
+
+  # ── Daily 2:00 AM PKT: Auto fix SEO issues ────────────────────────────────
+  seo-autofix:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 21 * * *'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: node autoFix.js
+
+  # ── Daily 2:30 AM PKT: Redirect manager ───────────────────────────────────
+  seo-redirects:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '30 21 * * *'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: node redirectManager.js
+
+  # ── Daily 3:00 AM PKT: SEO patterns ───────────────────────────────────────
+  seo-patterns:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 22 * * *'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: node seoPatterns.js
+
+  # ── Monday 3:30 AM PKT: Broken links ──────────────────────────────────────
+  broken-links:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '30 22 * * 1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: node brokenLinks.js
+
+  # ── Sunday 4:00 AM PKT: Technical SEO ─────────────────────────────────────
+  technical-seo:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 23 * * 0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: node technicalSEO.js
