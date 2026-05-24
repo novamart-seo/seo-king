@@ -46,18 +46,6 @@ jobs:
           path: seo-reports/
           retention-days: 30
 
-  # ── Daily 2:00 AM PKT: Auto fix SEO issues ────────────────────────────────
-  seo-autofix:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' && github.event.schedule == '0 21 * * *'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      - run: npm ci
-      - run: node autoFix.js
 
   # ── Daily 2:30 AM PKT: Redirect manager ───────────────────────────────────
   seo-redirects:
