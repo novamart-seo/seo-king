@@ -15,6 +15,8 @@ const GROQ_MODEL = 'llama-3.3-70b-versatile';
 const DAILY_LIMIT         = 980;   // Safe buffer under 1,000 RPD
 const CALLS_PER_PRODUCT   = 5;     // H1 + meta title + meta desc + body + tags
 const MAX_PRODUCTS_PER_DAY = Math.floor(DAILY_LIMIT / CALLS_PER_PRODUCT); // 196
+const MAX_RUN_MINUTES = 300; // 5 hour safety limit
+const RUN_START_TIME = Date.now();
 
 const RPM_LIMIT           = 28;    // Safe buffer under 30 RPM
 const MIN_DELAY_MS        = Math.ceil(60000 / RPM_LIMIT); // ~2142ms between calls
@@ -570,6 +572,14 @@ async function runSEOPatterns() {
 
   for (const product of toProcess) {
     if (dailyLimitReached()) {
+      saveProgress(progress);
+      process.exit(0);
+    }
+
+    // Stop if approaching 5 hour limit
+    const minutesElapsed = (Date.now() - RUN_START_TIME) / 60000;
+    if (minutesElapsed >= MAX_RUN_MINUTES) {
+      console.log(`⏱️ Time limit reached (${Math.round(minutesElapsed)}min) — saving progress`);
       saveProgress(progress);
       process.exit(0);
     }
