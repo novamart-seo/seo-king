@@ -2,6 +2,12 @@ name: SEO King Automation
 
 on:
   workflow_dispatch:
+    inputs:
+      product_id:
+        description: 'New Product ID (for instant fix only)'
+        required: false
+  repository_dispatch:
+    types: [new-product]
   schedule:
     - cron: '0 21 * * *'
     - cron: '30 21 * * *'
@@ -10,8 +16,29 @@ on:
     - cron: '0 23 * * 0'
 
 jobs:
+
+  # ── Instant fix when new product added ──────────────────────────────────
+  instant-seo-fix:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'new-product'
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: node newProduct.js
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NEW_PRODUCT_ID: ${{ github.event.client_payload.product_id }}
+
+  # ── Daily: Auto fix SEO issues ───────────────────────────────────────────
   seo-autofix:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 21 * * *'
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3
@@ -25,8 +52,10 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
+  # ── Daily: Redirect manager ──────────────────────────────────────────────
   seo-redirects:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '30 21 * * *'
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3
@@ -38,8 +67,10 @@ jobs:
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
 
+  # ── Daily: SEO patterns (Gemini + Groq) ─────────────────────────────────
   seo-patterns:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 22 * * *'
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3
@@ -53,8 +84,10 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
+  # ── Monday: Broken links ─────────────────────────────────────────────────
   broken-links:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '30 22 * * 1'
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3
@@ -66,8 +99,10 @@ jobs:
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
 
+  # ── Sunday: Technical SEO ────────────────────────────────────────────────
   technical-seo:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 23 * * 0'
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3

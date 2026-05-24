@@ -1,1 +1,0 @@
-web: npm install && node scheduler.js
