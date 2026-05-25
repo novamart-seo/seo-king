@@ -63,7 +63,9 @@ jobs:
   # ── Daily 3:00 AM PKT: SEO patterns ───────────────────────────────────────
   seo-patterns:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' && github.event.schedule == '0 22 * * *'
+    if: >
+  github.event_name == 'workflow_dispatch' ||
+  (github.event_name == 'schedule' && github.event.schedule == '0 22 * * *')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
