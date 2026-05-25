@@ -46,7 +46,6 @@ jobs:
           path: seo-reports/
           retention-days: 30
 
-
   # ── Daily 2:30 AM PKT: Redirect manager ───────────────────────────────────
   seo-redirects:
     runs-on: ubuntu-latest
@@ -64,8 +63,8 @@ jobs:
   seo-patterns:
     runs-on: ubuntu-latest
     if: >
-  github.event_name == 'workflow_dispatch' ||
-  (github.event_name == 'schedule' && github.event.schedule == '0 22 * * *')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 22 * * *')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
