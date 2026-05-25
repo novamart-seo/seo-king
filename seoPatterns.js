@@ -5,7 +5,7 @@ const fs = require('fs');
 const Groq = require('groq-sdk');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const STORE = process.env.SHOPIFY_STORE;
+const STORE = (process.env.SHOPIFY_STORE_URL || process.env.SHOPIFY_STORE || '').replace('https://', '').replace(/\/$/, '');
 const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
 // ─── Gemini Setup (Primary) ────────────────────────────────────────────────
