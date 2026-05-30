@@ -1,0 +1,9 @@
+{
+  "date": "Sat May 30 2026",
+  "key1": 240,
+  "key2": 240,
+  "groq": 22,
+  "key1_exhausted": true,
+  "key2_exhausted": true,
+  "groq_exhausted": false
+}

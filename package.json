@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "images": "node imageGenerator.js"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +14,8 @@
   "type": "commonjs",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.96.0",
+    "@dotenvx/dotenvx": "^1.69.1",
+    "@google/genai": "^2.6.0",
     "@google/generative-ai": "^0.24.1",
     "@shopify/shopify-api": "^13.0.0",
     "axios": "^1.16.1",

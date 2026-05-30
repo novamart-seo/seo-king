@@ -1,6 +1,7 @@
 /**
  * instantSeoFix.js
  * Core SEO engine — called by pollAndFix.js
+ * Uses GEMINI_API_KEY_2 (dedicated key for new products + technical tasks)
  *
  * Flow:
  *   fetchProduct() → buildPrompt() → Gemini (→ Groq fallback)
@@ -17,8 +18,8 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const fs   = require('fs');
 const path = require('path');
 
-// ─── Clients ──────────────────────────────────────────────────────────────
-const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// ─── Clients (Key 2 — dedicated for new products & technical tasks) ───────
+const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY_2);
 const groq   = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const SHOPIFY_STORE_URL    = process.env.SHOPIFY_STORE_URL;
@@ -85,7 +86,7 @@ Return ONLY this JSON:
 
 // ─── 3. AI calls ──────────────────────────────────────────────────────────
 async function callGemini(prompt) {
-  const model  = gemini.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  const model  = gemini.getGenerativeModel({ model: 'gemini-2.5-flash' });
   const result = await model.generateContent(prompt);
   const text   = result.response.text().replace(/```json|```/g, '').trim();
   return JSON.parse(text);
@@ -93,7 +94,7 @@ async function callGemini(prompt) {
 
 async function callGroq(prompt) {
   const res  = await groq.chat.completions.create({
-    model:    'llama3-70b-8192',
+    model:    'llama-3.3-70b-versatile',
     messages: [{ role: 'user', content: prompt }],
   });
   const text = res.choices[0].message.content.replace(/```json|```/g, '').trim();
@@ -163,20 +164,20 @@ async function instantSeoFix(productId, platform = 'shopify') {
   console.log(`   Images : ${product.images.length}`);
   console.log(`   Tags   : ${product.tags || 'none'}`);
 
-  // AI fix — Gemini first, Groq fallback
+  // AI fix — Gemini Key 2 first, Groq fallback
   const prompt = buildPrompt(product);
   let seoFix, usedModel;
 
   try {
-    console.log('🤖 Gemini...');
+    console.log('🤖 Gemini (Key 2)...');
     seoFix    = await callGemini(prompt);
-    usedModel = 'gemini-1.5-flash';
+    usedModel = 'gemini-2.5-flash';
     console.log('   ✅ Gemini OK');
   } catch (err) {
     console.warn(`   ⚠️  Gemini failed (${err.message})`);
     console.log('🔄 Groq fallback...');
     seoFix    = await callGroq(prompt);
-    usedModel = 'groq-llama3-70b';
+    usedModel = 'groq-llama3.3-70b';
     console.log('   ✅ Groq OK');
   }
 
