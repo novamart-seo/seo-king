@@ -1,161 +1,261 @@
-require('dotenv').config();
-const axios = require('axios');
+/**
+ * brokenLinks.js
+ * Checks all product, collection, and page URLs for Nova Mart.
+ *
+ * FIXES OVER PREVIOUS VERSION:
+ *  - Smart collections included (was missing before)
+ *  - maxRedirects: 0 so 301/302 are actually detected (not silently followed)
+ *  - Concurrency — checks 5 URLs at a time (was fully sequential)
+ *  - Results saved to broken-links-report.json for GitHub Actions artifacts
+ *  - Error types categorised: 404, redirect, timeout, other
+ *  - Active products only (status=active)
+ */
 
-const STORE = process.env.SHOPIFY_STORE;
-const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+require('dotenv').config();
+
+const axios = require('axios');
+const fs    = require('fs');
+
+const STORE    = process.env.SHOPIFY_STORE;
+const TOKEN    = process.env.SHOPIFY_ACCESS_TOKEN;
 const SITE_URL = 'https://mynovamart.store';
+
+const CONCURRENCY  = 5;
+const TIMEOUT_MS   = 10000;
+const DELAY_MS     = 200;   // between batches
+const REPORT_FILE  = './broken-links-report.json';
 
 const shopify = axios.create({
   baseURL: `https://${STORE}/admin/api/2024-01`,
-  headers: {
-    'X-Shopify-Access-Token': TOKEN,
-    'Content-Type': 'application/json'
-  }
+  headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' }
 });
 
-const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const wait = ms => new Promise(r => setTimeout(r, ms));
 
-// Check if a URL is accessible
-async function checkURL(url, retries = 2) {
+// ══════════════════════════════════════════════════════════════════════════
+// CONCURRENCY LIMITER
+// ══════════════════════════════════════════════════════════════════════════
+
+class ConcurrencyLimit {
+  constructor(limit) { this.limit = limit; this.running = 0; this.queue = []; }
+  async run(fn) {
+    if (this.running >= this.limit)
+      await new Promise(r => this.queue.push(r));
+    this.running++;
+    try { return await fn(); }
+    finally {
+      this.running--;
+      if (this.queue.length > 0) this.queue.shift()();
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// URL CHECKER
+// ══════════════════════════════════════════════════════════════════════════
+
+async function checkURL(item, retries = 2) {
   for (let i = 0; i < retries; i++) {
     try {
-      const response = await axios.get(url, {
-        timeout: 10000,
-        maxRedirects: 5,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; SEO-King-Bot/1.0)'
-        }
+      const response = await axios.get(item.url, {
+        timeout: TIMEOUT_MS,
+        maxRedirects: 0,          // Don't follow — detect 301/302 directly
+        validateStatus: s => s < 400 || s === 301 || s === 302,  // don't throw on redirects
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SEO-King-Bot/1.0)' }
       });
-      return { url, status: response.status, ok: true };
-    } catch (error) {
-      if (i === retries - 1) {
-        return {
-          url,
-          status: error.response?.status || 0,
-          ok: false,
-          error: error.message
-        };
+
+      const status = response.status;
+
+      if (status === 301 || status === 302) {
+        const location = response.headers['location'] || '';
+        return { ...item, status, type: 'redirect', location };
       }
-      await wait(2000);
+
+      return { ...item, status, type: 'ok' };
+
+    } catch (error) {
+      const status = error.response?.status || 0;
+
+      // 404 is definitive — no retry needed
+      if (status === 404) return { ...item, status, type: 'broken' };
+
+      // Timeout or network error — retry once
+      if (i < retries - 1) { await wait(2000); continue; }
+
+      const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
+      return {
+        ...item,
+        status,
+        type:  isTimeout ? 'timeout' : 'error',
+        error: error.message,
+      };
     }
   }
 }
 
-// Get all product URLs
+// ══════════════════════════════════════════════════════════════════════════
+// URL FETCHERS
+// ══════════════════════════════════════════════════════════════════════════
+
 async function getProductURLs() {
-  let products = [];
-  let url = '/products.json?limit=250&fields=id,title,handle';
-
+  const products = [];
+  let url = '/products.json?limit=250&status=active&fields=id,title,handle';
   while (url) {
-    const response = await shopify.get(url);
-    products = [...products, ...response.data.products];
-    const linkHeader = response.headers['link'];
-    if (linkHeader && linkHeader.includes('rel="next"')) {
-      const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-      url = match ? match[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
-    } else {
-      url = null;
-    }
+    const res  = await shopify.get(url);
+    products.push(...res.data.products);
+    const link = res.headers['link'] || '';
+    const next = link.match(/<([^>]+)>;\s*rel="next"/);
+    url = next ? next[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
+  }
+  return products.map(p => ({ type: 'product', title: p.title, url: `${SITE_URL}/products/${p.handle}` }));
+}
+
+async function getCollectionURLs() {
+  const collections = [];
+
+  // Custom collections
+  let url = '/custom_collections.json?limit=250&fields=id,title,handle';
+  while (url) {
+    const res = await shopify.get(url);
+    collections.push(...res.data.custom_collections.map(c => ({ ...c, _kind: 'custom' })));
+    const link = res.headers['link'] || '';
+    const next = link.match(/<([^>]+)>;\s*rel="next"/);
+    url = next ? next[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
   }
 
-  return products.map(p => ({
-    title: p.title,
-    url: `${SITE_URL}/products/${p.handle}`
-  }));
-}
+  // Smart collections (was missing before)
+  url = '/smart_collections.json?limit=250&fields=id,title,handle';
+  while (url) {
+    const res = await shopify.get(url);
+    collections.push(...res.data.smart_collections.map(c => ({ ...c, _kind: 'smart' })));
+    const link = res.headers['link'] || '';
+    const next = link.match(/<([^>]+)>;\s*rel="next"/);
+    url = next ? next[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
+  }
 
-// Get all collection URLs
-async function getCollectionURLs() {
-  const response = await shopify.get('/custom_collections.json?limit=250&fields=id,title,handle');
-  const collections = response.data.custom_collections;
   return collections.map(c => ({
+    type: 'collection',
     title: c.title,
-    url: `${SITE_URL}/collections/${c.handle}`
+    url: `${SITE_URL}/collections/${c.handle}`,
   }));
 }
 
-// Get all page URLs
 async function getPageURLs() {
-  const response = await shopify.get('/pages.json?limit=250&fields=id,title,handle');
-  const pages = response.data.pages;
-  return pages.map(p => ({
-    title: p.title,
-    url: `${SITE_URL}/pages/${p.handle}`
-  }));
+  const res   = await shopify.get('/pages.json?limit=250&fields=id,title,handle');
+  const pages = res.data.pages;
+  return pages.map(p => ({ type: 'page', title: p.title, url: `${SITE_URL}/pages/${p.handle}` }));
 }
 
-// Run broken link checker
+// ══════════════════════════════════════════════════════════════════════════
+// MAIN
+// ══════════════════════════════════════════════════════════════════════════
+
 async function runBrokenLinkChecker() {
-  console.log('\n🔍 Starting Broken Link Checker for Nova Mart...\n');
+  console.log('\n🔍 Nova Mart — Broken Link Checker');
+  console.log('='.repeat(55));
 
-  try {
-    // Gather all URLs
-    console.log('Gathering all URLs...');
-    const productURLs = await getProductURLs();
-    const collectionURLs = await getCollectionURLs();
-    const pageURLs = await getPageURLs();
+  console.log('\nGathering all URLs...');
+  const [productURLs, collectionURLs, pageURLs] = await Promise.all([
+    getProductURLs(),
+    getCollectionURLs(),
+    getPageURLs(),
+  ]);
 
-    const allURLs = [
-      ...productURLs,
-      ...collectionURLs,
-      ...pageURLs
-    ];
+  const allURLs = [...productURLs, ...collectionURLs, ...pageURLs];
 
-    console.log(`Found ${productURLs.length} products`);
-    console.log(`Found ${collectionURLs.length} collections`);
-    console.log(`Found ${pageURLs.length} pages`);
-    console.log(`Total URLs to check: ${allURLs.length}\n`);
-    console.log('='.repeat(50));
+  console.log(`📦 Products    : ${productURLs.length}`);
+  console.log(`🗂️  Collections : ${collectionURLs.length}`);
+  console.log(`📄 Pages       : ${pageURLs.length}`);
+  console.log(`🔗 Total       : ${allURLs.length}\n`);
+  console.log('='.repeat(55));
 
-    const broken = [];
-    const redirected = [];
-    const ok = [];
+  const results  = { ok: [], broken: [], redirects: [], timeouts: [], errors: [] };
+  const limiter  = new ConcurrencyLimit(CONCURRENCY);
+  let checked    = 0;
 
-    let checked = 0;
-    for (const item of allURLs) {
-      const result = await checkURL(item.url);
+  // Process in batches with concurrency
+  const checks = allURLs.map(item =>
+    limiter.run(async () => {
+      const result = await checkURL(item);
       checked++;
 
-      if (!result.ok && result.status === 404) {
-        broken.push({ ...item, status: result.status });
-        console.log(`❌ 404: ${item.title}`);
-        console.log(`   ${item.url}`);
-      } else if (result.status === 301 || result.status === 302) {
-        redirected.push({ ...item, status: result.status });
-        console.log(`⚠️ Redirect: ${item.title}`);
-      } else if (result.ok) {
-        ok.push(item);
-        console.log(`✅ OK: ${item.title}`);
+      const prefix = `[${checked}/${allURLs.length}]`;
+      if (result.type === 'ok') {
+        console.log(`${prefix} ✅ ${result.status} — ${result.title}`);
+        results.ok.push(result);
+      } else if (result.type === 'broken') {
+        console.log(`${prefix} ❌ 404 — ${result.title}`);
+        console.log(`         ${result.url}`);
+        results.broken.push(result);
+      } else if (result.type === 'redirect') {
+        console.log(`${prefix} ↪️  ${result.status} — ${result.title} → ${result.location}`);
+        results.redirects.push(result);
+      } else if (result.type === 'timeout') {
+        console.log(`${prefix} ⏱️  Timeout — ${result.title}`);
+        results.timeouts.push(result);
       } else {
-        console.log(`⚠️ Error ${result.status}: ${item.title}`);
+        console.log(`${prefix} ⚠️  Error ${result.status} — ${result.title}: ${result.error}`);
+        results.errors.push(result);
       }
 
-      console.log(`   Progress: ${checked}/${allURLs.length}`);
-      await wait(500);
-    }
+      await wait(DELAY_MS);
+    })
+  );
 
-    console.log('\n' + '='.repeat(50));
-    console.log('\n📊 BROKEN LINK REPORT');
-    console.log('='.repeat(50));
-    console.log(`Total URLs checked: ${allURLs.length}`);
-    console.log(`✅ Working: ${ok.length}`);
-    console.log(`⚠️ Redirects: ${redirected.length}`);
-    console.log(`❌ Broken (404): ${broken.length}`);
+  await Promise.all(checks);
 
-    if (broken.length > 0) {
-      console.log('\n❌ BROKEN LINKS TO FIX:');
-      broken.forEach(b => {
-        console.log(`\n  Product: ${b.title}`);
-        console.log(`  URL: ${b.url}`);
-        console.log(`  Status: ${b.status}`);
-      });
-    } else {
-      console.log('\n✅ No broken links found!');
-    }
+  // ── Summary ──────────────────────────────────────────────────────────
+  console.log('\n' + '='.repeat(55));
+  console.log('📊 BROKEN LINK REPORT');
+  console.log('='.repeat(55));
+  console.log(`✅ Working      : ${results.ok.length}`);
+  console.log(`❌ Broken (404) : ${results.broken.length}`);
+  console.log(`↪️  Redirects    : ${results.redirects.length}`);
+  console.log(`⏱️  Timeouts     : ${results.timeouts.length}`);
+  console.log(`⚠️  Other errors : ${results.errors.length}`);
 
-  } catch (error) {
-    console.error('Broken link checker failed:', error.message);
+  if (results.broken.length > 0) {
+    console.log('\n❌ BROKEN LINKS (404):');
+    results.broken.forEach(b => {
+      console.log(`\n  [${b.type}] ${b.title}`);
+      console.log(`  ${b.url}`);
+    });
+  } else {
+    console.log('\n✅ No broken links found!');
   }
+
+  if (results.redirects.length > 0) {
+    console.log('\n↪️  REDIRECTS DETECTED:');
+    results.redirects.forEach(r => {
+      console.log(`\n  [${r.type}] ${r.title}`);
+      console.log(`  From : ${r.url}`);
+      console.log(`  To   : ${r.location}`);
+    });
+  }
+
+  // ── Save report ───────────────────────────────────────────────────────
+  const report = {
+    date:      new Date().toISOString(),
+    summary: {
+      total:     allURLs.length,
+      ok:        results.ok.length,
+      broken:    results.broken.length,
+      redirects: results.redirects.length,
+      timeouts:  results.timeouts.length,
+      errors:    results.errors.length,
+    },
+    broken:    results.broken,
+    redirects: results.redirects,
+    timeouts:  results.timeouts,
+    errors:    results.errors,
+  };
+
+  fs.writeFileSync(REPORT_FILE, JSON.stringify(report, null, 2));
+  console.log(`\n📄 Full report saved → ${REPORT_FILE}`);
+  console.log('='.repeat(55));
 }
 
-runBrokenLinkChecker();
+runBrokenLinkChecker().catch(err => {
+  console.error('❌ brokenLinks crashed:', err.message);
+  process.exit(1);
+});

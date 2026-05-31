@@ -1,36 +1,58 @@
+/**
+ * seoPatterns.js
+ * Runs nightly at 2am via GitHub Actions.
+ *
+ * BATCH MODE: all 8 fields in ONE API call per product.
+ * KEY STRATEGY: apiManager.js handles all rotation automatically.
+ *   Gemini Key1→2→3→4 → Groq Key1→2→3→4 → DeepSeek Key1→2→3
+ *
+ * FIXES:
+ *  - 429 / 503 / RESOURCE_EXHAUSTED (per-minute) are TEMPORARY → retry, never kill key.
+ *  - Only an explicit "per day / daily" quota message marks a key exhausted.
+ *  - Counter increments only on SUCCESS (quota never wasted on failures).
+ *  - Body HTML cleaned: stray intro paragraph removed, banned words stripped.
+ */
+
 require('dotenv').config();
 
 const axios = require('axios');
 const fs    = require('fs');
-const Groq  = require('groq-sdk');
-const sharp = require('sharp');
 
-// ─── Config ────────────────────────────────────────────────────────────────
-const STORE = process.env.SHOPIFY_STORE;
+// ─── API Manager (handles all key rotation) ────────────────────────────────
+const { callAIJson, verifyAllKeys, hasCapacity, getStatus } = require('./apiManager');
+
+// ─── Store + Auth ──────────────────────────────────────────────────────────
+const STORE = (process.env.SHOPIFY_STORE_URL || process.env.SHOPIFY_STORE || '')
+  .replace('https://', '').replace(/\/$/, '');
 const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
-// Gemini (primary) — 3rd API key
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY_3;
-const GEMINI_MODEL   = 'gemini-2.5-flash';
-const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+// ─── Run Settings ──────────────────────────────────────────────────────────
+const MAX_RUN_MINUTES = 320;
+const RUN_START_TIME  = Date.now();
 
-// Groq (fallback)
-const groq       = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
+// ─── Banned words ───────────────────────────────────────────────────────────
+const BANNED_WORDS = /\b(Experience|Enjoy|Amazing|Best|Quality|Perfect|Discover)\b/gi;
 
-// ─── Rate / Daily Limits ───────────────────────────────────────────────────
-const GEMINI_RPM   = 10;
-const GEMINI_DAILY = 490;
-const GROQ_RPM     = 28;
-const GROQ_DAILY   = 490;
+// ─── Cooldown / Tier settings ──────────────────────────────────────────────
+const COOLDOWN_DAYS        = 45;
+const TIER1_LOCK_DAYS      = 60;
+const TIER1_TAG            = 'seo-tier1';
+const POLLANDFIX_LOCK_DAYS = 45;
 
-// ─── Image Settings ────────────────────────────────────────────────────────
-const COMPRESS_THRESHOLD_KB = 200;
-const WEBP_QUALITY          = 82;
+// ─── Theme templates ──────────────────────────────────────────────────────
+const THEME_TEMPLATES = {
+  'tech-product':      'electronics, gadgets, appliances, vacuum cleaners, audio, earbuds, headphones, cameras, computers, smart devices, chargers, cables, power banks, speakers, keyboards, mice, monitors, printers, routers',
+  'fashion-product':   'clothing, apparel, shirts, pants, dresses, shoes, footwear, handbags, jewellery, watches, sunglasses, belts, scarves, caps, hats, wallets, purses',
+  'pet-products-page': 'pet food, cat litter, dog accessories, pet toys, pet grooming, aquarium, bird feeders, pet beds, leashes, collars',
+  'baby-product-page': 'baby clothes, diapers, prams, strollers, baby toys, infant formula, nursery items, baby bottles, baby monitors',
+  'toys':              'toys, games, puzzles, board games, action figures, kids play sets, remote control cars, lego, building blocks, dolls',
+  'product':           'default fallback — luggage, travel bags, trolley cases, suitcases, backpacks, home decor, kitchen items, furniture, sports equipment, books',
+};
 
-const CALL_LOG_FILE = './collection-seo-calls.json';
+// ─── File paths ────────────────────────────────────────────────────────────
+const PROGRESS_FILE = './progress.json';
 
-// ─── Shopify Client ────────────────────────────────────────────────────────
+// ─── Shopify client ────────────────────────────────────────────────────────
 const shopify = axios.create({
   baseURL: `https://${STORE}/admin/api/2024-01`,
   headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' }
@@ -38,410 +60,504 @@ const shopify = axios.create({
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── Call Counters ─────────────────────────────────────────────────────────
-let geminiCallsToday = 0, groqCallsToday = 0;
-let lastGeminiCall   = 0, lastGroqCall   = 0;
-let geminiRpmCount   = 0, groqRpmCount   = 0;
-let geminiRpmWindow  = Date.now(), groqRpmWindow = Date.now();
+// ══════════════════════════════════════════════════════════════════════════
+// PROGRESS
+// ══════════════════════════════════════════════════════════════════════════
 
-function loadCallLog() {
+function loadProgress() {
   try {
-    if (fs.existsSync(CALL_LOG_FILE)) {
-      const data = JSON.parse(fs.readFileSync(CALL_LOG_FILE, 'utf8'));
-      if (data.date === new Date().toDateString()) {
-        geminiCallsToday = data.gemini || 0;
-        groqCallsToday   = data.groq   || 0;
-        console.log(`📊 Gemini calls today : ${geminiCallsToday}/${GEMINI_DAILY}`);
-        console.log(`📊 Groq calls today   : ${groqCallsToday}/${GROQ_DAILY}`);
-        return;
-      }
+    if (fs.existsSync(PROGRESS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PROGRESS_FILE, 'utf8'));
+      if (!data.phase) data.phase = 'baseline';
+      return data;
     }
   } catch (e) {}
-  geminiCallsToday = groqCallsToday = 0;
-  console.log(`📊 Fresh day — Gemini: 0/${GEMINI_DAILY} | Groq: 0/${GROQ_DAILY}`);
-}
-
-function saveCallLog() {
-  fs.writeFileSync(CALL_LOG_FILE, JSON.stringify({
-    date:   new Date().toDateString(),
-    gemini: geminiCallsToday,
-    groq:   groqCallsToday
-  }, null, 2));
-}
-
-// ─── Rate Limiters ─────────────────────────────────────────────────────────
-async function enforceGeminiRate() {
-  const now = Date.now();
-  if (now - geminiRpmWindow > 60000) { geminiRpmCount = 0; geminiRpmWindow = now; }
-  const minDelay = Math.ceil(60000 / GEMINI_RPM);
-  if (now - lastGeminiCall < minDelay) await wait(minDelay - (now - lastGeminiCall));
-  if (geminiRpmCount >= GEMINI_RPM) {
-    const pause = 60000 - (Date.now() - geminiRpmWindow) + 2000;
-    console.log(`   ⏳ Gemini RPM limit — waiting ${Math.round(pause / 1000)}s...`);
-    await wait(pause);
-    geminiRpmCount = 0; geminiRpmWindow = Date.now();
-  }
-}
-
-async function enforceGroqRate() {
-  const now = Date.now();
-  if (now - groqRpmWindow > 60000) { groqRpmCount = 0; groqRpmWindow = now; }
-  const minDelay = Math.ceil(60000 / GROQ_RPM);
-  if (now - lastGroqCall < minDelay) await wait(minDelay - (now - lastGroqCall));
-  if (groqRpmCount >= GROQ_RPM) {
-    const pause = 60000 - (Date.now() - groqRpmWindow) + 2000;
-    console.log(`   ⏳ Groq RPM limit — waiting ${Math.round(pause / 1000)}s...`);
-    await wait(pause);
-    groqRpmCount = 0; groqRpmWindow = Date.now();
-  }
-}
-
-// ─── Gemini Call ───────────────────────────────────────────────────────────
-async function callGemini(prompt, retries = 3) {
-  if (geminiCallsToday >= GEMINI_DAILY) return null;
-  await enforceGeminiRate();
-  let backoff = 12000;
-  for (let i = 0; i < retries; i++) {
-    try {
-      geminiRpmCount++; lastGeminiCall = Date.now();
-      geminiCallsToday++; saveCallLog();
-      const res = await axios.post(GEMINI_URL, {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 2048, temperature: 0.4 }
-      });
-      return res.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
-    } catch (err) {
-      geminiCallsToday = Math.max(0, geminiCallsToday - 1);
-      geminiRpmCount   = Math.max(0, geminiRpmCount - 1);
-      saveCallLog();
-      const status = err.response?.status;
-      if (status === 400) { console.log('   🛑 Gemini key 3 invalid — check GEMINI_API_KEY_3'); return null; }
-      if ((status === 429 || status === 503) && i < retries - 1) {
-        console.log(`   ⏳ Gemini rate limit — waiting ${backoff / 1000}s...`);
-        await wait(backoff); backoff = Math.min(backoff * 2, 60000);
-      } else { console.log(`   ⚠️  Gemini error (${status}) — falling back to Groq`); return null; }
-    }
-  }
-  return null;
-}
-
-// ─── Groq Fallback Call ────────────────────────────────────────────────────
-async function callGroq(prompt, retries = 3) {
-  if (groqCallsToday >= GROQ_DAILY) return null;
-  await enforceGroqRate();
-  let backoff = 15000;
-  for (let i = 0; i < retries; i++) {
-    try {
-      groqRpmCount++; lastGroqCall = Date.now();
-      groqCallsToday++; saveCallLog();
-      const res = await groq.chat.completions.create({
-        model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }],
-        max_tokens: 2048, temperature: 0.4
-      });
-      return res.choices[0].message.content.trim();
-    } catch (err) {
-      groqCallsToday = Math.max(0, groqCallsToday - 1);
-      groqRpmCount   = Math.max(0, groqRpmCount - 1);
-      saveCallLog();
-      const msg = err.message || '';
-      if (msg.includes('401')) { console.error('   🛑 Invalid Groq key.'); return null; }
-      if (msg.includes('429') && i < retries - 1) {
-        console.log(`   ⏳ Groq rate limit — waiting ${backoff / 1000}s...`);
-        await wait(backoff); backoff = Math.min(backoff * 1.8, 60000);
-      } else return null;
-    }
-  }
-  return null;
-}
-
-// ─── AI with Fallback ──────────────────────────────────────────────────────
-async function callAI(prompt) {
-  const g = await callGemini(prompt);
-  if (g) return { text: g, source: 'gemini' };
-  console.log(`   🔄 Falling back to Groq...`);
-  const q = await callGroq(prompt);
-  if (q) return { text: q, source: 'groq' };
-  return null;
-}
-
-// ─── Full SEO Generator ────────────────────────────────────────────────────
-// Generates ALL fields in ONE AI call:
-//   metaTitle, metaDescription, bodyHtml (H2 + intro + 4 bullets + CTA), handle, altText
-async function generateCollectionSEO(collection) {
-  const title       = collection.title || '';
-  const currentDesc = collection.body_html?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || '';
-  const hasImage    = !!collection.image?.src;
-  const storeName   = 'Nova Mart';
-
-  const prompt = `You are a senior Google-standard SEO copywriter for "${storeName}", a Shopify fashion and lifestyle e-commerce store.
-
-Write complete, publish-ready SEO content for this collection page.
-Return ONLY valid JSON — no markdown fences, no extra text, just the raw JSON object.
-
-Collection: "${title}"
-Existing description hint: "${currentDesc.slice(0, 300) || 'None'}"
-Has cover image: ${hasImage}
-
-Return exactly this JSON structure:
-{
-  "metaTitle": "50-60 chars. Primary keyword near front, brand at end after |. E.g: Women's Luggage & Travel Bags | Nova Mart",
-  "metaDescription": "150-160 chars. Includes primary + secondary keyword. Ends with soft CTA. No duplicate of metaTitle.",
-  "bodyHtml": "<h2>Catchy 4-6 word benefit-led heading</h2><p>2-sentence intro naturally weaving in the primary keyword and what makes this collection great at Nova Mart.</p><ul><li><strong>Sub-category or Feature 1</strong> — one short benefit sentence</li><li><strong>Sub-category or Feature 2</strong> — one short benefit sentence</li><li><strong>Sub-category or Feature 3</strong> — one short benefit sentence</li><li><strong>Sub-category or Feature 4</strong> — one short benefit sentence</li></ul><p>1-sentence closing CTA mentioning Nova Mart and a value reason like free returns, wide range, or quality.</p>",
-  "handle": "seo-url-slug-lowercase-hyphens-max-50-chars",
-  "altText": "${hasImage ? '110-125 char alt text for the collection cover image. Visually descriptive. Includes collection name. No phrase image of or photo of.' : 'N/A'}"
-}
-
-Hard rules:
-- metaTitle under 60 chars exactly, no ALL CAPS
-- metaDescription 150-160 chars exactly
-- bodyHtml must follow the exact HTML structure shown — h2, intro p, ul with 4 li, closing p
-- The 4 bullet items must reflect realistic sub-categories or product features for the "${title}" collection
-- handle: lowercase, hyphens only, no stop words, max 50 chars
-- All text written for humans, not keyword-stuffed`;
-
-  const result = await callAI(prompt);
-  if (!result) return null;
-
-  try {
-    // Strip markdown fences
-    let clean = result.text
-      .replace(/^```json\s*/i, '')
-      .replace(/^```\s*/i, '')
-      .replace(/```$/i, '')
-      .trim();
-
-    // If truncated (no closing brace), attempt recovery
-    if (!clean.endsWith('}')) {
-      // Remove last incomplete key-value pair and close the object
-      clean = clean.replace(/,?\s*"[^"]*"?\s*:\s*"[^"]*$/, '').replace(/,\s*$/, '') + '\n}';
-    }
-
-    const parsed = JSON.parse(clean);
-
-    // Validate required fields
-    if (!parsed.metaTitle || !parsed.metaDescription || !parsed.bodyHtml) {
-      console.error(`   ⚠️  AI response missing required fields`);
-      return null;
-    }
-
-    parsed._source = result.source;
-    return parsed;
-  } catch (e) {
-    console.error(`   ⚠️  JSON parse failed: ${e.message}`);
-    console.error(`   Raw response snippet: ${result.text.slice(0, 400)}`);
-    return null;
-  }
-}
-
-// ─── Image Helpers ─────────────────────────────────────────────────────────
-async function downloadImage(url) {
-  const res = await axios.get(url, { responseType: 'arraybuffer' });
-  return Buffer.from(res.data);
-}
-
-async function convertToWebP(buffer, altText) {
-  return await sharp(buffer)
-    .webp({ quality: WEBP_QUALITY })
-    .withMetadata({ exif: { IFD0: { ImageDescription: altText || '' } } })
-    .toBuffer();
-}
-
-function toSlug(str) {
-  return str.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
-}
-
-async function getImageSizeKB(url) {
-  try {
-    const res = await axios.head(url);
-    return Math.round(parseInt(res.headers['content-length'] || 0) / 1024);
-  } catch { return 0; }
-}
-
-// ─── Fetch All Collections (paginated) ────────────────────────────────────
-async function getAllCollections() {
-  const collections = [];
-  for (const [type, key] of [['custom', 'custom_collections'], ['smart', 'smart_collections']]) {
-    let url = `/${key}.json?limit=250`;
-    while (url) {
-      const res = await shopify.get(url);
-      collections.push(...res.data[key].map(c => ({ ...c, _type: type })));
-      const next = res.headers['link']?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
-      url = next ? new URL(next).pathname.replace('/admin/api/2024-01', '') + new URL(next).search : null;
-    }
-  }
-  return collections;
-}
-
-// ─── Apply All SEO Fields to Shopify ──────────────────────────────────────
-async function applyCollectionSEO(collection, seo) {
-  const isCustom = collection._type === 'custom';
-  const endpoint = isCustom
-    ? `/custom_collections/${collection.id}.json`
-    : `/smart_collections/${collection.id}.json`;
-  const key = isCustom ? 'custom_collection' : 'smart_collection';
-
-  // 1. Push meta title, meta description, full body HTML, handle
-  const payload = {
-    id:                                collection.id,
-    body_html:                         seo.bodyHtml,
-    metafields_global_title_tag:       seo.metaTitle,
-    metafields_global_description_tag: seo.metaDescription,
+  return {
+    phase:              'baseline',
+    cooldown_until:     null,
+    baseline_complete:  false,
+    completed:          [],
+    tier_last_seo:      {},
+    pollandfix_touched: {},
   };
+}
 
-  // Only update handle if current one is weak (numeric, blank, or exact title slug)
-  const currentHandle = collection.handle || '';
-  if (seo.handle && (!currentHandle || /^\d/.test(currentHandle))) {
-    payload.handle = seo.handle;
+function saveProgress(p) {
+  fs.writeFileSync(PROGRESS_FILE, JSON.stringify(p, null, 2));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════════════════════════════════════
+
+function shortenTitle(title, maxChars) {
+  if (title.length <= maxChars) return title;
+  const fillers = [/\bwith\b/gi, /\bfor\b/gi, /\band\b/gi, /\bthe\b/gi, /\bof\b/gi, /\bin\b/gi, /\ba\b/gi, /\ban\b/gi];
+  let shortened = title;
+  for (const filler of fillers) {
+    if (shortened.length <= maxChars) break;
+    shortened = shortened.replace(filler, '').replace(/\s+/g, ' ').trim();
   }
+  if (shortened.length > maxChars) shortened = shortened.slice(0, maxChars).replace(/\s+\S*$/, '').trim();
+  return shortened;
+}
 
-  await shopify.put(endpoint, { [key]: payload });
-  console.log(`   ✅ Meta title, meta description, description, handle updated`);
+function enforceMetaTitle(text) {
+  const suffix = ' | Nova Mart';
+  if (!text.includes('| Nova Mart')) text = text.replace(/\|.*$/, '').trim() + suffix;
+  if (text.length > 60) {
+    const withoutSuffix = text.replace(suffix, '').trim();
+    const trimmed = withoutSuffix.slice(0, 60 - suffix.length).replace(/\s+\S*$/, '').trim();
+    text = trimmed + suffix;
+  }
+  return text;
+}
 
-  // 2. Image — optimize + set alt text
-  if (collection.image?.src && seo.altText && seo.altText !== 'N/A') {
-    const src       = collection.image.src;
-    const filename  = src.split('/').pop().split('?')[0];
-    const isWebP    = filename.toLowerCase().endsWith('.webp');
-    const isNumeric = /^[0-9]+\.(jpg|png|jpeg|webp)$/i.test(filename);
-    const sizeKB    = await getImageSizeKB(src);
-    const needsConv = !isWebP || isNumeric || sizeKB > COMPRESS_THRESHOLD_KB;
+function enforceMetaDesc(text) {
+  const cta = 'Free Delivery at Nova Mart!';
+  if (!text.includes(cta)) text = text.replace(/[.!]$/, '') + '. ' + cta;
+  if (text.length > 160) {
+    const withoutCta = text.replace(cta, '').trim().replace(/[.,!]$/, '');
+    text = withoutCta.slice(0, 160 - cta.length - 1).replace(/\s+\S*$/, '').trim() + ' ' + cta;
+  }
+  if (text.length < 140) {
+    const pads = [
+      ' Trusted by thousands of Nova Mart shoppers.',
+      ' Top-rated and in stock now.',
+      ' Ships fast across Pakistan.',
+      ' Premium pick at an unbeatable value.',
+    ];
+    for (const p of pads) {
+      const withoutCta = text.replace(' ' + cta, '').replace(cta, '').trim().replace(/[.,!]$/, '');
+      const candidate  = withoutCta + p + ' ' + cta;
+      if (candidate.length >= 140 && candidate.length <= 160) { text = candidate; break; }
+    }
+  }
+  return text;
+}
 
-    if (needsConv) {
-      console.log(`   🖼️  Converting image (${sizeKB}KB → WebP)...`);
-      const buf     = await downloadImage(src);
-      const webpBuf = await convertToWebP(buf, seo.altText);
-      const newKB   = Math.round(webpBuf.length / 1024);
-      console.log(`   📉 ${sizeKB}KB → ${newKB}KB`);
-      await shopify.put(endpoint, {
-        [key]: {
-          id: collection.id,
-          image: {
-            attachment: webpBuf.toString('base64'),
-            filename:   toSlug(collection.title) + '-collection.webp',
-            alt:        seo.altText
-          }
-        }
+function cleanBodyHtml(html) {
+  let body = html.trim();
+  const hookIndex = body.search(/<p>\s*<em>/i);
+  if (hookIndex > 0) {
+    console.log('   ✂️  Removed stray intro paragraph before the <em> hook');
+    body = body.slice(hookIndex);
+  }
+  if (BANNED_WORDS.test(body)) {
+    console.log('   ✂️  Removed banned words from body');
+    body = body
+      .replace(BANNED_WORDS, '')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/\s+([.,!?])/g, '$1')
+      .replace(/<(\w+)>\s+/g, '<$1>')
+      .trim();
+  }
+  BANNED_WORDS.lastIndex = 0;
+  return body;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// BATCH PROMPT
+// ══════════════════════════════════════════════════════════════════════════
+
+function buildBatchPrompt(product) {
+  const desc      = product.body_html?.replace(/<[^>]*>/g, '').slice(0, 500) || '';
+  const shortName = shortenTitle(product.title, 40);
+  const templates = Object.keys(THEME_TEMPLATES).join(' | ');
+
+  return `You are an expert SEO copywriter for Nova Mart, a Pakistani e-commerce store.
+Generate ALL 8 SEO fields for this product in ONE JSON response.
+
+Product name : ${product.title}
+Short name   : ${shortName}
+Description  : ${desc}
+
+IMPORTANT: Return ONLY valid JSON. No markdown, no backticks, no explanation.
+Escape all special characters inside string values properly.
+Use this exact structure:
+{
+  "h1": "...",
+  "metaTitle": "...",
+  "metaDesc": "...",
+  "bodyHtml": "...",
+  "tags": "tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8",
+  "urlHandle": "...",
+  "techSummary": "...",
+  "template": "..."
+}
+
+━━━ FIELD RULES ━━━
+
+H1 (h1):
+- Pattern: [Short Product Name] – [Key Feature] [Size if fits]
+- Under 70 characters hard limit
+- No quotes, no punctuation at end
+- Examples: Pet Shaver – Stainless Steel Blades 1-Piece | Iron Man ANC Earbuds – HiFi 13mm Drivers
+
+META TITLE (metaTitle):
+- Pattern: [Short Name] – [Specific Spec] | Nova Mart
+- Under 60 characters hard limit including "| Nova Mart"
+- Must always end with exactly: | Nova Mart
+- Real numbers/units preferred: 100ml, 13mm, 500W, 30L
+- Examples: Pet Shaver – Stainless Steel | Nova Mart | Cordless Vacuum – 55Kpa 500W | Nova Mart
+
+META DESCRIPTION (metaDesc):
+- Emotional hook + 2 specific specs + "Free Delivery at Nova Mart!"
+- Between 140 and 160 characters exactly
+- Must end with: Free Delivery at Nova Mart!
+- No quotes anywhere in the text
+- Never start with: Experience, Enjoy, Discover
+- Never use: Amazing, Best, Quality, Perfect
+
+BODY HTML (bodyHtml):
+- Minimum 800 words, Nova Mart voice: sophisticated, minimalist, confident
+- The VERY FIRST element MUST be <p><em>hook</em></p>. Do NOT write ANY intro
+  paragraph, sentence, or text before this hook. The hook is always first.
+- Escape all HTML properly for JSON (use \\n for newlines inside the JSON string)
+- Structure (in this exact order):
+  <p><em>[punchy 8-12 word hook]</em></p>
+  <h2>Key Features</h2><ul><li><b>Feature:</b> detail</li>x5-7</ul>
+  <h2>Why It Works For You</h2><p>3-4 sentences to customer</p>
+  <h2>What Makes Nova Mart Different</h2><p>2-3 sentences, mention free delivery</p>
+  <h2>Technical Specifications</h2><table><tr><th>Specification</th><th>Details</th></tr>x5-8 rows</table>
+  <h2>Frequently Asked Questions</h2>
+  <details><summary>question</summary><p>answer</p></details> x3
+- FORBIDDEN WORDS anywhere in the body: Experience, Enjoy, Amazing, Best, Quality,
+  Perfect, Discover. Never use any of them. Output is invalid if you do.
+
+TAGS (tags):
+- 8-10 comma-separated lowercase SEO tags, each under 25 chars
+- Mix: product type, material, feature, use case, audience
+
+URL HANDLE (urlHandle):
+- lowercase-hyphens-only, no /products/ prefix, max 60 chars
+- Pattern: product-name-key-feature-size
+- Examples: pet-shaver-stainless-1-piece | cordless-vacuum-55kpa-500w
+
+TECH SHORT SUMMARY (techSummary):
+- Exactly: Spec1 • Spec2 • Spec3
+- Real numbers and units, each spec under 20 chars, total under 80 chars
+- Examples: 500W Motor • 55Kpa Suction • HEPA Filter | 13mm HiFi Drivers • ANC • 15H Battery
+
+TEMPLATE (template):
+- Pick ONE from: ${templates}
+- Luggage, suitcases, trolley cases, travel bags → always: product
+- Only pick specific template if very confident it matches
+- Return exact template name only, nothing else`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SHOPIFY HELPERS
+// ══════════════════════════════════════════════════════════════════════════
+
+async function saveMetafield(productId, namespace, mfKey, value) {
+  try {
+    const res      = await shopify.get(`/products/${productId}/metafields.json`);
+    const existing = res.data.metafields.find(m => m.namespace === namespace && m.key === mfKey);
+    if (existing) {
+      await shopify.put(`/products/${productId}/metafields/${existing.id}.json`, {
+        metafield: { id: existing.id, value, type: 'single_line_text_field' }
       });
-      console.log(`   ✅ Image replaced: optimized WebP + alt text`);
-    } else if (!collection.image.alt?.trim()) {
-      await shopify.put(endpoint, { [key]: { id: collection.id, image: { alt: seo.altText } } });
-      console.log(`   ✅ Image alt text set`);
     } else {
-      console.log(`   ⏭️  Image already optimized — alt text preserved`);
+      await shopify.post(`/products/${productId}/metafields.json`, {
+        metafield: { namespace, key: mfKey, value, type: 'single_line_text_field' }
+      });
     }
-  } else if (!collection.image?.src) {
-    console.log(`   ℹ️  No cover image on this collection`);
+  } catch (err) {
+    console.error(`   ❌ Metafield (${namespace}.${mfKey}) error: ${err.message}`);
   }
 }
 
-// ─── Save Results Log ──────────────────────────────────────────────────────
-function saveResults(results) {
-  const file = './collection-seo-results.json';
-  fs.writeFileSync(file, JSON.stringify(results, null, 2));
-  console.log(`\n📄 Full results saved → ${file}`);
+async function getAllProducts() {
+  let products = [];
+  let url = '/products.json?limit=250&fields=id,title,handle,body_html,tags,images,variants,product_type';
+  while (url) {
+    const res  = await shopify.get(url);
+    products   = [...products, ...res.data.products];
+    const link = res.headers['link'];
+    if (link?.includes('rel="next"')) {
+      const m = link.match(/<([^>]+)>;\s*rel="next"/);
+      url = m ? m[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
+    } else { url = null; }
+  }
+  return products;
 }
 
-// ─── Main ──────────────────────────────────────────────────────────────────
-async function runCollectionSEO() {
-  console.log('\n🚀 Nova Mart — Full Collection SEO Optimizer');
-  console.log('   Primary  : Gemini 2.5 Flash  (GEMINI_API_KEY_3)');
-  console.log('   Fallback : Groq llama-3.3-70b-versatile');
-  console.log('='.repeat(60));
+// ══════════════════════════════════════════════════════════════════════════
+// TIER HELPERS
+// ══════════════════════════════════════════════════════════════════════════
 
-  loadCallLog();
+function isTier1(product) {
+  return (product.tags || '').split(',').map(t => t.trim().toLowerCase()).includes(TIER1_TAG);
+}
 
-  // ── Verify Gemini key ────────────────────────────────────────────────────
-  console.log('\n🔑 Verifying Gemini API key 3...');
-  const test = await callGemini('Reply with one word: OK');
-  if (test) {
-    console.log('   ✅ Gemini key 3 verified');
+function daysSince(isoString) {
+  if (!isoString) return Infinity;
+  return (Date.now() - new Date(isoString).getTime()) / (1000 * 60 * 60 * 24);
+}
+
+function shouldSkip(product, progress) {
+  if (isTier1(product)) {
+    const lastSeo = progress.tier_last_seo[product.id];
+    if (!lastSeo || daysSince(lastSeo) < TIER1_LOCK_DAYS) return `Tier 1 lock (${TIER1_LOCK_DAYS}d)`;
+  }
+  const pfDate = progress.pollandfix_touched?.[product.id];
+  if (pfDate && daysSince(pfDate) < POLLANDFIX_LOCK_DAYS)
+    return `pollAndFix lock (${Math.round(POLLANDFIX_LOCK_DAYS - daysSince(pfDate))}d left)`;
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// PROCESS ONE PRODUCT
+// ══════════════════════════════════════════════════════════════════════════
+
+async function applyPatterns(product) {
+  console.log(`\n🔧 ${product.title}`);
+
+  const prompt = buildBatchPrompt(product);
+  console.log('   [BATCH] Generating all 8 fields in one call...');
+
+  // ── Single call through apiManager — auto-rotates all keys ───────────────
+  const result = await callAIJson(prompt);
+
+  if (!result) {
+    console.log('   ❌ AI generation failed — will retry next run');
+    return false;
+  }
+
+  const batch  = result.data;
+  const engine = result.keyLabel;
+
+  if (!batch) {
+    console.log(`   ⚠️  Could not parse JSON from ${engine} — skipping`);
+    return false;
+  }
+
+  console.log(`   ✅ Batch received from ${engine}`);
+
+  const updates = {};
+
+  if (batch.h1) {
+    let h1 = batch.h1.trim();
+    if (h1.length > 70) h1 = h1.slice(0, 70).replace(/\s+\S*$/, '').trim();
+    console.log(`   ✅ H1: ${h1}  (${h1.length} chars)`);
+    updates.title = h1;
+  } else console.log('   ⚠️  H1 missing');
+
+  if (batch.metaTitle) {
+    const mt = enforceMetaTitle(batch.metaTitle.trim());
+    console.log(`   ✅ Meta Title: ${mt}  (${mt.length} chars)`);
+    await saveMetafield(product.id, 'global', 'title_tag', mt);
+  } else console.log('   ⚠️  Meta Title missing');
+
+  if (batch.metaDesc) {
+    const md = enforceMetaDesc(batch.metaDesc.trim());
+    console.log(`   ✅ Meta Desc: ${md.length} chars`);
+    await saveMetafield(product.id, 'global', 'description_tag', md);
+  } else console.log('   ⚠️  Meta Desc missing');
+
+  if (batch.bodyHtml) {
+    const body = cleanBodyHtml(batch.bodyHtml);
+    console.log(`   ✅ Body HTML: ${body.length} chars`);
+    updates.body_html = body;
+  } else console.log('   ⚠️  Body HTML missing');
+
+  if (batch.tags) {
+    const tagArr = batch.tags.split(',').map(t => t.trim()).filter(Boolean);
+    console.log(`   ✅ Tags: ${tagArr.join(', ')}`);
+    updates.tags = tagArr.join(', ');
+  } else console.log('   ⚠️  Tags missing');
+
+  if (batch.urlHandle) {
+    const cleanUrl = batch.urlHandle.trim()
+      .replace(/^\/products\//, '').toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-')
+      .replace(/^-|-$/g, '').slice(0, 60);
+    console.log(`   ✅ URL: /products/${cleanUrl}`);
+    updates.handle = cleanUrl;
+  } else console.log('   ⚠️  URL missing');
+
+  if (batch.techSummary) {
+    console.log(`   ✅ Tech Summary: ${batch.techSummary}`);
+    await saveMetafield(product.id, 'custom', 'tech_short_summary', batch.techSummary.trim());
+  } else console.log('   ⚠️  Tech Summary missing');
+
+  if (batch.template) {
+    const valid   = Object.keys(THEME_TEMPLATES);
+    const matched = valid.find(t => t === batch.template.trim().toLowerCase()) || 'product';
+    console.log(`   ✅ Template: ${matched}`);
+    updates.template_suffix = matched === 'product' ? '' : matched;
+  } else console.log('   ⚠️  Template missing');
+
+  if (Object.keys(updates).length > 0) {
+    await shopify.put(`/products/${product.id}.json`, { product: { id: product.id, ...updates } });
+    console.log('   ✅ Saved to Shopify');
+  }
+
+  return true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// PHASE RUNNERS
+// ══════════════════════════════════════════════════════════════════════════
+
+async function runBaseline(progress, products) {
+  console.log('\n⚡ PHASE 1 — BASELINE RUN');
+  console.log(`   Goal : optimize all ${products.length} products once`);
+  console.log(`   Mode : BATCH — 1 API call per product`);
+  console.log('='.repeat(55));
+
+  const remaining = products.filter(p => !progress.completed.includes(p.id));
+  if (remaining.length === 0) {
+    console.log('\n🎉 Baseline complete! Triggering 45-day cooldown...');
+    progress.phase          = 'cooldown';
+    progress.baseline_complete = true;
+    progress.cooldown_until = new Date(Date.now() + COOLDOWN_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    saveProgress(progress);
+    console.log(`🔒 Cooldown until: ${progress.cooldown_until}`);
+    return;
+  }
+
+  console.log(`\n📦 Total   : ${products.length}`);
+  console.log(`✅ Done    : ${progress.completed.length}`);
+  console.log(`📋 Tonight : up to ${remaining.length} remaining\n`);
+
+  let doneThisSession = 0;
+  for (const product of remaining) {
+    if (!hasCapacity()) { console.log('\n🛑 All API limits reached — saving progress.'); break; }
+    if ((Date.now() - RUN_START_TIME) / 60000 >= MAX_RUN_MINUTES) { console.log('\n⏱️  Time limit reached.'); break; }
+
+    const success = await applyPatterns(product);
+    if (success) { progress.completed.push(product.id); doneThisSession++; }
+    saveProgress(progress);
+    console.log(`   📊 Tonight: ${doneThisSession} | Baseline: ${progress.completed.length}/${products.length}`);
+  }
+
+  if (products.every(p => progress.completed.includes(p.id))) {
+    console.log('\n🎉 Baseline complete! Triggering 45-day cooldown...');
+    progress.phase          = 'cooldown';
+    progress.baseline_complete = true;
+    progress.cooldown_until = new Date(Date.now() + COOLDOWN_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    saveProgress(progress);
+    console.log(`🔒 Cooldown until: ${progress.cooldown_until}`);
   } else {
-    console.log('   ⚠️  Gemini unavailable — verifying Groq fallback...');
-    try {
-      await groq.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{ role: 'user', content: 'Reply OK' }],
-        max_tokens: 5
-      });
-      console.log('   ✅ Groq fallback verified');
-      groqCallsToday++; saveCallLog();
-    } catch {
-      console.error('   ❌ Both Gemini and Groq failed. Check .env keys.');
-      process.exit(1);
-    }
+    const left = products.filter(p => !progress.completed.includes(p.id)).length;
+    console.log(`\n▶️  ${left} products left — resuming tomorrow.`);
   }
-
-  // ── Fetch all collections ────────────────────────────────────────────────
-  console.log('\n📂 Fetching all collections...');
-  const collections = await getAllCollections();
-  const customCount = collections.filter(c => c._type === 'custom').length;
-  const smartCount  = collections.filter(c => c._type === 'smart').length;
-  console.log(`   Found ${collections.length} total (${customCount} custom, ${smartCount} smart)\n`);
-
-  if (!collections.length) { console.log('No collections found.'); return; }
-
-  const results = [];
-  let optimized = 0, errors = 0;
-
-  for (let i = 0; i < collections.length; i++) {
-    const col = collections[i];
-    console.log(`[${i + 1}/${collections.length}] 🗂️  "${col.title}"  (${col._type})`);
-
-    try {
-      console.log(`   🤖 Generating SEO content via AI...`);
-      const seo = await generateCollectionSEO(col);
-
-      if (!seo) {
-        console.log(`   ❌ AI generation failed — skipping\n`);
-        errors++;
-        results.push({ id: col.id, title: col.title, status: 'error', reason: 'AI generation failed' });
-        continue;
-      }
-
-      // Preview generated content
-      console.log(`   📌 Meta title       : ${seo.metaTitle}`);
-      console.log(`   📌 Meta description : ${seo.metaDescription}`);
-      console.log(`   📌 Handle           : ${seo.handle}`);
-      console.log(`   📌 H2 heading       : ${seo.bodyHtml.match(/<h2>(.*?)<\/h2>/)?.[1] || '—'}`);
-      if (seo.altText !== 'N/A') console.log(`   📌 Alt text         : ${seo.altText}`);
-      console.log(`   🤖 Source           : ${seo._source}`);
-
-      await applyCollectionSEO(col, seo);
-
-      console.log(`   ✅ Done\n`);
-      optimized++;
-      results.push({
-        id: col.id, title: col.title, type: col._type,
-        status: 'optimized', source: seo._source,
-        seo: {
-          metaTitle:       seo.metaTitle,
-          metaDescription: seo.metaDescription,
-          handle:          seo.handle,
-          altText:         seo.altText,
-          bodyHtml:        seo.bodyHtml
-        }
-      });
-
-    } catch (err) {
-      console.error(`   ❌ ${err.message}\n`);
-      errors++;
-      results.push({ id: col.id, title: col.title, status: 'error', reason: err.message });
-    }
-
-    // Polite delay between collections
-    if (i < collections.length - 1) await wait(1500);
-  }
-
-  // ── Summary ───────────────────────────────────────────────────────────────
-  console.log('='.repeat(60));
-  console.log('✅ COLLECTION SEO COMPLETE');
-  console.log(`📂 Total collections : ${collections.length}`);
-  console.log(`✨ Optimized         : ${optimized}`);
-  console.log(`❌ Errors            : ${errors}`);
-  console.log(`🤖 Gemini calls      : ${geminiCallsToday}/${GEMINI_DAILY}`);
-  console.log(`🤖 Groq calls        : ${groqCallsToday}/${GROQ_DAILY}`);
-
-  saveResults(results);
+  console.log(`\n📦 Done tonight: ${doneThisSession}`);
 }
 
-runCollectionSEO().catch(console.error);
+async function runCooldown(progress) {
+  const until    = new Date(progress.cooldown_until);
+  const daysLeft = Math.ceil((until - Date.now()) / (1000 * 60 * 60 * 24));
+  if (Date.now() < until) {
+    console.log('\n🔒 PHASE 2 — COOLDOWN ACTIVE');
+    console.log(`   Ends: ${until.toDateString()} | Days left: ${daysLeft}`);
+    console.log('   ✅ No changes. New products handled by pollAndFix.js.');
+    return;
+  }
+  console.log('\n✅ Cooldown complete! Moving to Tier Mode...');
+  progress.phase          = 'tier';
+  progress.cooldown_until = null;
+  progress.completed      = [];
+  saveProgress(progress);
+}
+
+async function runTierMode(progress, products) {
+  console.log('\n🏷️  PHASE 3 — TIER MODE');
+  console.log('='.repeat(55));
+  const eligible = products.filter(p => {
+    const reason = shouldSkip(p, progress);
+    if (reason) { console.log(`   ⏭️  "${p.title}" — ${reason}`); return false; }
+    return true;
+  });
+  console.log(`\n📦 Total: ${products.length} | ⏭️ Skipped: ${products.length - eligible.length} | 📋 Eligible: ${eligible.length}\n`);
+  if (eligible.length === 0) { console.log('✅ All products locked. Nothing to do.'); return; }
+
+  let doneThisSession = 0;
+  for (const product of eligible) {
+    if (!hasCapacity()) { console.log('\n🛑 All API limits reached.'); break; }
+    if ((Date.now() - RUN_START_TIME) / 60000 >= MAX_RUN_MINUTES) { console.log('\n⏱️  Time limit reached.'); break; }
+
+    const success = await applyPatterns(product);
+    if (success) { progress.tier_last_seo[product.id] = new Date().toISOString(); doneThisSession++; }
+    saveProgress(progress);
+    console.log(`   📊 Tonight: ${doneThisSession}`);
+  }
+  console.log(`\n📦 Done tonight: ${doneThisSession}`);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SINGLE PRODUCT MODE
+// ══════════════════════════════════════════════════════════════════════════
+
+async function runSingleProduct(productId) {
+  console.log('\n🎯 Nova Mart SEO Patterns — Single Product Mode');
+  console.log('   Strategy: Gemini Key1→2→3→4 → Groq Key1→2→3→4 → DeepSeek Key1→2→3');
+  console.log('   Mode    : BATCH (1 API call = all 8 fields) → saves to Shopify');
+  console.log('='.repeat(55));
+
+  await verifyAllKeys();
+
+  console.log(`\n🔍 Fetching product ID: ${productId}...`);
+  let product;
+  try {
+    const res = await shopify.get(`/products/${productId}.json?fields=id,title,handle,body_html,tags,images,variants,product_type`);
+    product = res.data.product;
+  } catch (err) {
+    console.error(`❌ Could not fetch product ${productId}: ${err.message}`);
+    process.exit(1);
+  }
+
+  console.log(`✅ Found: "${product.title}"\n`);
+  const success = await applyPatterns(product);
+
+  console.log('\n' + '='.repeat(55));
+  console.log(success ? '✅ Done — all fields saved to Shopify.' : '❌ Failed — check errors above.');
+  console.log(getStatus());
+  console.log('='.repeat(55));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ENTRY POINT
+// ══════════════════════════════════════════════════════════════════════════
+
+async function main() {
+  const productArg = process.argv.find(a => a.startsWith('--product='));
+  if (productArg) {
+    const productId = productArg.split('=')[1];
+    if (!productId) { console.error('❌ Usage: node seoPatterns.js --product=<id>'); process.exit(1); }
+    return runSingleProduct(productId);
+  }
+
+  console.log('\n🚀 Nova Mart SEO Patterns — Nightly Run');
+  console.log('   Strategy: Gemini Key1→2→3→4 → Groq Key1→2→3→4 → DeepSeek Key1→2→3');
+  console.log('   Mode    : BATCH (1 API call per product = all 8 fields)');
+  console.log('='.repeat(55));
+
+  await verifyAllKeys();
+
+  const progress = loadProgress();
+  const products = await getAllProducts();
+
+  console.log(`\n📦 Products in store : ${products.length}`);
+  console.log(`📂 Current phase     : ${(progress.phase || 'baseline').toUpperCase()}`);
+
+  if (progress.phase === 'baseline') {
+    await runBaseline(progress, products);
+  } else if (progress.phase === 'cooldown') {
+    await runCooldown(progress);
+    if (progress.phase === 'tier') await runTierMode(progress, products);
+  } else if (progress.phase === 'tier') {
+    await runTierMode(progress, products);
+  }
+
+  console.log('\n' + '='.repeat(55));
+  console.log(getStatus());
+  console.log('='.repeat(55));
+}
+
+main().catch(err => {
+  console.error('❌ seoPatterns crashed:', err.message);
+  process.exit(1);
+});

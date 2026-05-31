@@ -5,51 +5,31 @@
  * WHAT IT DOES:
  *  - Converts images to WebP, compresses oversized ones
  *  - Renames files to SEO-friendly slugs
- *  - Generates alt text (descriptive) via Groq
- *  - Generates image title (short, keyword-focused) via Groq
+ *  - Generates alt text (descriptive) via apiManager
+ *  - Generates image title (short, keyword-focused) via apiManager
  *  - Saves both alt + title to Shopify image object
  *  - Tracks progress in techseo-progress.json — safe to stop/resume
- *
- * FIXES OVER PREVIOUS VERSION:
- *  - Counter increments only on SUCCESS (not before)
- *  - Upload verified before delete (no orphan images)
- *  - Re-fetches product images after each replacement (no stale array)
- *  - Download timeout added (30s)
- *  - sharp EXIF wrapped in try/catch fallback
- *  - getImageSizeKB called once per image (cached)
- *  - Progress tracking — skips already-done products on re-run
- *  - Groq verify call does NOT count against daily limit
- *  - Image title field added (separate from alt text)
  */
 
 require('dotenv').config();
 
 const axios = require('axios');
 const fs    = require('fs');
-const Groq  = require('groq-sdk');
 const sharp = require('sharp');
+const { callAIJson, verifyAllKeys, getStatus } = require('./apiManager');
 
 // ─── Store + Auth ──────────────────────────────────────────────────────────
 const STORE = process.env.SHOPIFY_STORE;
 const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
-const groq  = new Groq({ apiKey: process.env.GROQ_API_KEY_2 });
-
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 // ─── Limits ────────────────────────────────────────────────────────────────
-const DAILY_LIMIT      = 970;   // conservative — leaves buffer for retries
-const RPM_LIMIT        = 28;
-const MIN_DELAY_MS     = Math.ceil(60000 / RPM_LIMIT);
-const DOWNLOAD_TIMEOUT = 30000; // 30s — prevents hanging on slow CDNs
-
-// ─── Image Settings ────────────────────────────────────────────────────────
+const DOWNLOAD_TIMEOUT      = 30000;
 const COMPRESS_THRESHOLD_KB = 200;
 const WEBP_QUALITY          = 82;
 const CONCURRENCY           = 3;
 
 // ─── File paths ────────────────────────────────────────────────────────────
-const DAILY_CALL_FILE = './techseo-calls.json';
-const PROGRESS_FILE   = './techseo-progress.json';
+const PROGRESS_FILE = './techseo-progress.json';
 
 // ─── Shopify client ────────────────────────────────────────────────────────
 const shopify = axios.create({
@@ -80,34 +60,6 @@ class ConcurrencyLimit {
 const limiter = new ConcurrencyLimit(CONCURRENCY);
 
 // ══════════════════════════════════════════════════════════════════════════
-// DAILY CALL COUNTER
-// ══════════════════════════════════════════════════════════════════════════
-
-let totalCallsToday = 0;
-
-function loadDailyCalls() {
-  try {
-    if (fs.existsSync(DAILY_CALL_FILE)) {
-      const data = JSON.parse(fs.readFileSync(DAILY_CALL_FILE, 'utf8'));
-      if (data.date === new Date().toDateString()) {
-        totalCallsToday = data.calls;
-        console.log(`📊 Groq calls today: ${totalCallsToday}/${DAILY_LIMIT}`);
-        return;
-      }
-    }
-  } catch (e) {}
-  totalCallsToday = 0;
-  console.log(`📊 Groq calls today: 0/${DAILY_LIMIT} (fresh day)`);
-}
-
-function saveDailyCalls() {
-  fs.writeFileSync(DAILY_CALL_FILE, JSON.stringify({
-    date:  new Date().toDateString(),
-    calls: totalCallsToday,
-  }, null, 2));
-}
-
-// ══════════════════════════════════════════════════════════════════════════
 // PROGRESS TRACKING
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -124,50 +76,11 @@ function saveProgress(p) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// RATE LIMITER
+// AI — ALT TEXT + IMAGE TITLE (two fields, one call via apiManager)
 // ══════════════════════════════════════════════════════════════════════════
 
-let lastCallTime      = 0;
-let callsThisMinute   = 0;
-let minuteWindowStart = Date.now();
-
-async function enforceRateLimit() {
-  if (Date.now() - minuteWindowStart > 60000) {
-    callsThisMinute = 0;
-    minuteWindowStart = Date.now();
-  }
-  const gap = Date.now() - lastCallTime;
-  if (gap < MIN_DELAY_MS) await wait(MIN_DELAY_MS - gap);
-  if (callsThisMinute >= RPM_LIMIT) {
-    const pause = 60000 - (Date.now() - minuteWindowStart) + 1500;
-    console.log(`   ⏳ RPM limit — waiting ${Math.round(pause / 1000)}s...`);
-    await wait(pause);
-    callsThisMinute = 0;
-    minuteWindowStart = Date.now();
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// GROQ — ALT TEXT + IMAGE TITLE (two fields, one call)
-// ══════════════════════════════════════════════════════════════════════════
-
-async function generateImageFields(productTitle, imageIndex, retries = 4) {
-  if (totalCallsToday >= DAILY_LIMIT) return null;
-
-  await enforceRateLimit();
-
-  let backoff = 15000;
-
-  for (let i = 0; i < retries; i++) {
-    try {
-      callsThisMinute++;
-      lastCallTime = Date.now();
-
-      const response = await groq.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{
-          role: 'user',
-          content: `Generate SEO image metadata for image ${imageIndex + 1} of the product: "${productTitle}"
+async function generateImageFields(productTitle, imageIndex) {
+  const prompt = `Generate SEO image metadata for image ${imageIndex + 1} of the product: "${productTitle}"
 
 Return ONLY a JSON object with exactly these two fields:
 {
@@ -175,60 +88,20 @@ Return ONLY a JSON object with exactly these two fields:
   "title": "short keyword-focused title, max 60 chars, product name + key feature, no filler words"
 }
 
-No explanation, no markdown, no backticks. Raw JSON only.`,
-        }],
-        max_tokens: 120,
-        temperature: 0.6,
-        response_format: { type: 'json_object' },
-      });
+No explanation, no markdown, no backticks. Raw JSON only.`;
 
-      // Only count on success
-      totalCallsToday++;
-      saveDailyCalls();
+  const result = await callAIJson(prompt);
+  if (!result) return null;
 
-      const parsed = JSON.parse(response.choices[0].message.content.trim());
-      return {
-        alt:   (parsed.alt   || '').slice(0, 125).trim(),
-        title: (parsed.title || '').slice(0, 60).trim(),
-      };
-
-    } catch (error) {
-      callsThisMinute = Math.max(0, callsThisMinute - 1);
-      const msg = (error.message || '').toLowerCase();
-
-      if (msg.includes('401')) { console.log('   🛑 Invalid Groq API key.'); process.exit(1); }
-      if (msg.includes('daily') || msg.includes('per day')) { totalCallsToday = DAILY_LIMIT; saveDailyCalls(); return null; }
-      if (msg.includes('429') && i < retries - 1) {
-        console.log(`   ⏳ Rate limit — waiting ${backoff / 1000}s...`);
-        await wait(backoff);
-        backoff = Math.min(backoff * 1.8, 60000);
-        callsThisMinute = 0; minuteWindowStart = Date.now();
-      } else {
-        console.log(`   ⚠️  Groq error: ${msg.slice(0, 60)}`);
-        return null;
-      }
-    }
-  }
-  return null;
+  console.log(`      🤖 ${result.keyLabel}`);
+  return {
+    alt:   (result.data.alt   || '').slice(0, 125).trim(),
+    title: (result.data.title || '').slice(0, 60).trim(),
+  };
 }
 
-async function generateCollectionImageFields(collectionTitle, retries = 4) {
-  if (totalCallsToday >= DAILY_LIMIT) return null;
-
-  await enforceRateLimit();
-
-  let backoff = 15000;
-
-  for (let i = 0; i < retries; i++) {
-    try {
-      callsThisMinute++;
-      lastCallTime = Date.now();
-
-      const response = await groq.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{
-          role: 'user',
-          content: `Generate SEO image metadata for the banner image of the Shopify collection: "${collectionTitle}"
+async function generateCollectionImageFields(collectionTitle) {
+  const prompt = `Generate SEO image metadata for the banner image of the Shopify collection: "${collectionTitle}"
 
 Return ONLY a JSON object with exactly these two fields:
 {
@@ -236,40 +109,16 @@ Return ONLY a JSON object with exactly these two fields:
   "title": "short keyword-focused title, max 60 chars, collection name + category keywords"
 }
 
-No explanation, no markdown, no backticks. Raw JSON only.`,
-        }],
-        max_tokens: 120,
-        temperature: 0.6,
-        response_format: { type: 'json_object' },
-      });
+No explanation, no markdown, no backticks. Raw JSON only.`;
 
-      totalCallsToday++;
-      saveDailyCalls();
+  const result = await callAIJson(prompt);
+  if (!result) return null;
 
-      const parsed = JSON.parse(response.choices[0].message.content.trim());
-      return {
-        alt:   (parsed.alt   || '').slice(0, 125).trim(),
-        title: (parsed.title || '').slice(0, 60).trim(),
-      };
-
-    } catch (error) {
-      callsThisMinute = Math.max(0, callsThisMinute - 1);
-      const msg = (error.message || '').toLowerCase();
-
-      if (msg.includes('401')) { console.log('   🛑 Invalid Groq API key.'); process.exit(1); }
-      if (msg.includes('daily') || msg.includes('per day')) { totalCallsToday = DAILY_LIMIT; saveDailyCalls(); return null; }
-      if (msg.includes('429') && i < retries - 1) {
-        console.log(`   ⏳ Rate limit — waiting ${backoff / 1000}s...`);
-        await wait(backoff);
-        backoff = Math.min(backoff * 1.8, 60000);
-        callsThisMinute = 0; minuteWindowStart = Date.now();
-      } else {
-        console.log(`   ⚠️  Groq error: ${msg.slice(0, 60)}`);
-        return null;
-      }
-    }
-  }
-  return null;
+  console.log(`   🤖 ${result.keyLabel}`);
+  return {
+    alt:   (result.data.alt   || '').slice(0, 125).trim(),
+    title: (result.data.title || '').slice(0, 60).trim(),
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -286,13 +135,12 @@ async function downloadImage(url) {
 
 async function convertToWebP(buffer, altText) {
   try {
-    // Try with EXIF metadata first
     return await sharp(buffer)
       .webp({ quality: WEBP_QUALITY })
       .withMetadata({ exif: { IFD0: { ImageDescription: altText || '' } } })
       .toBuffer();
   } catch {
-    // Fallback: convert without EXIF (handles PNGs and other formats that reject EXIF)
+    // Fallback: convert without EXIF (handles PNGs that reject EXIF)
     return await sharp(buffer)
       .webp({ quality: WEBP_QUALITY })
       .toBuffer();
@@ -338,8 +186,8 @@ async function uploadProductImage(productId, buffer, filename, alt, title, posit
     image: {
       attachment: buffer.toString('base64'),
       filename,
-      alt:   alt   || '',
-      name:  title || '',   // Shopify image "name" = the title field shown above alt in admin
+      alt:      alt   || '',
+      name:     title || '',
       position,
     }
   });
@@ -352,10 +200,7 @@ async function deleteProductImage(productId, imageId) {
 
 async function updateImageAltAndTitle(productId, imageId, alt, title) {
   await shopify.put(`/products/${productId}/images/${imageId}.json`, {
-    image: {
-      alt:  alt   || '',
-      name: title || '',
-    }
+    image: { alt: alt || '', name: title || '' }
   });
 }
 
@@ -405,16 +250,16 @@ async function getAllCollections() {
 // ══════════════════════════════════════════════════════════════════════════
 
 async function processProductImage(product, img, index) {
-  const filename  = img.src.split('/').pop().split('?')[0];
-  const isWebP    = filename.toLowerCase().endsWith('.webp');
-  const isNumeric = /^[0-9]+\.(jpg|png|jpeg|webp)$/i.test(filename);
-  const missingAlt   = !img.alt   || img.alt.trim()  === '';
-  const missingTitle = !img.name  || img.name.trim() === '';
+  const filename     = img.src.split('/').pop().split('?')[0];
+  const isWebP       = filename.toLowerCase().endsWith('.webp');
+  const isNumeric    = /^[0-9]+\.(jpg|png|jpeg|webp)$/i.test(filename);
+  const missingAlt   = !img.alt  || img.alt.trim()  === '';
+  const missingTitle = !img.name || img.name.trim() === '';
 
   // Check size once and cache it
-  const sizeKB        = await getImageSizeKB(img.src);
-  const oversized     = sizeKB > COMPRESS_THRESHOLD_KB;
-  const needsConvert  = !isWebP || isNumeric || oversized;
+  const sizeKB       = await getImageSizeKB(img.src);
+  const oversized    = sizeKB > COMPRESS_THRESHOLD_KB;
+  const needsConvert = !isWebP || isNumeric || oversized;
   const needsMetadata = missingAlt || missingTitle;
 
   // Skip only when ALL four conditions are already met:
@@ -426,11 +271,11 @@ async function processProductImage(product, img, index) {
 
   console.log(`   🖼️  Image ${index + 1}: ${filename} (${sizeKB}KB)`);
 
-  // Generate alt + title together in one Groq call
-  let alt   = img.alt   || '';
-  let title = img.name  || '';
+  // Generate alt + title together in one AI call
+  let alt   = img.alt  || '';
+  let title = img.name || '';
 
-  if (needsMetadata && totalCallsToday < DAILY_LIMIT) {
+  if (needsMetadata) {
     console.log(`      Generating alt text + title...`);
     const fields = await generateImageFields(product.title, index);
     if (fields) {
@@ -438,23 +283,24 @@ async function processProductImage(product, img, index) {
       if (missingTitle) title = fields.title;
       console.log(`      Alt  : ${alt}`);
       console.log(`      Title: ${title}`);
+    } else {
+      // Fallback when all AI keys exhausted
+      alt   = alt   || `${product.title} - Image ${index + 1}`;
+      title = title || product.title.slice(0, 60);
+      console.log(`      ⚠️  AI unavailable — using fallback metadata`);
     }
-  } else if (needsMetadata) {
-    // Fallback when Groq limit hit
-    alt   = alt   || `${product.title} - Image ${index + 1}`;
-    title = title || product.title.slice(0, 60);
   }
 
   if (needsConvert) {
     console.log(`      Downloading...`);
-    const buffer   = await downloadImage(img.src);
-    const webpBuf  = await convertToWebP(buffer, alt);
-    const newSizeKB  = Math.round(webpBuf.length / 1024);
+    const buffer      = await downloadImage(img.src);
+    const webpBuf     = await convertToWebP(buffer, alt);
+    const newSizeKB   = Math.round(webpBuf.length / 1024);
     const newFilename = generateFilename(product.title, index);
 
     console.log(`      Compressed: ${sizeKB}KB → ${newSizeKB}KB`);
 
-    // Upload first, verify it succeeded, THEN delete old image
+    // Upload first, verify success, THEN delete old image
     const uploaded = await uploadProductImage(
       product.id, webpBuf, newFilename, alt, title, img.position
     );
@@ -467,8 +313,7 @@ async function processProductImage(product, img, index) {
     try {
       await deleteProductImage(product.id, img.id);
     } catch (delErr) {
-      console.log(`      ⚠️  Upload succeeded but old image delete failed: ${delErr.message}`);
-      // Not fatal — the new image is live, old one can be cleaned manually
+      console.log(`      ⚠️  Upload OK but old image delete failed: ${delErr.message}`);
     }
 
     console.log(`      ✅ Replaced with optimized WebP + alt + title`);
@@ -492,7 +337,7 @@ async function processProduct(product) {
 
   const stats = { converted: 0, altOnly: 0, skipped: 0, errors: 0 };
 
-  // Always fetch fresh image list before starting (avoids stale array)
+  // Always fetch fresh image list (avoids stale array after replacements)
   let freshImages;
   try {
     freshImages = await getProductImages(product.id);
@@ -509,10 +354,8 @@ async function processProduct(product) {
 
       if (result.action === 'converted') {
         stats.converted++;
-        // Re-fetch images after a replacement so next iteration has correct IDs/positions
-        try {
-          freshImages = await getProductImages(product.id);
-        } catch { /* non-fatal — next image will use slightly stale data */ }
+        // Re-fetch after replacement so next iteration has correct IDs/positions
+        try { freshImages = await getProductImages(product.id); } catch {}
       } else if (result.action === 'alt_only') stats.altOnly++;
       else if (result.action === 'skipped')   stats.skipped++;
       else if (result.action === 'error')     stats.errors++;
@@ -540,7 +383,6 @@ async function processCollections(progress) {
   let totalConverted = 0, totalAltOnly = 0, totalSkipped = 0, totalErrors = 0;
 
   for (const collection of collections) {
-    // Progress skip
     if (progress.completedCollections.includes(collection.id)) {
       console.log(`   ⏭️  "${collection.title}" — already done`);
       totalSkipped++;
@@ -554,13 +396,12 @@ async function processCollections(progress) {
       continue;
     }
 
-    const img        = collection.image;
-    const filename   = img.src.split('/').pop().split('?')[0];
-    const isWebP     = filename.toLowerCase().endsWith('.webp');
-    const isNumeric  = /^[0-9]+\.(jpg|png|jpeg|webp)$/i.test(filename);
+    const img          = collection.image;
+    const filename     = img.src.split('/').pop().split('?')[0];
+    const isWebP       = filename.toLowerCase().endsWith('.webp');
+    const isNumeric    = /^[0-9]+\.(jpg|png|jpeg|webp)$/i.test(filename);
     const missingAlt   = !img.alt  || img.alt.trim()  === '';
     const missingTitle = !img.name || img.name.trim() === '';
-
     const sizeKB       = await getImageSizeKB(img.src);
     const needsConvert = !isWebP || isNumeric || sizeKB > COMPRESS_THRESHOLD_KB;
 
@@ -578,7 +419,7 @@ async function processCollections(progress) {
       let alt   = img.alt  || '';
       let title = img.name || '';
 
-      if ((missingAlt || missingTitle) && totalCallsToday < DAILY_LIMIT) {
+      if (missingAlt || missingTitle) {
         console.log(`   Generating alt text + title...`);
         const fields = await generateCollectionImageFields(collection.title);
         if (fields) {
@@ -586,20 +427,21 @@ async function processCollections(progress) {
           if (missingTitle) title = fields.title;
           console.log(`   Alt  : ${alt}`);
           console.log(`   Title: ${title}`);
+        } else {
+          alt   = alt   || `${collection.title} collection banner`;
+          title = title || collection.title.slice(0, 60);
+          console.log(`   ⚠️  AI unavailable — using fallback metadata`);
         }
-      } else if (missingAlt || missingTitle) {
-        alt   = alt   || `${collection.title} collection banner`;
-        title = title || collection.title.slice(0, 60);
       }
 
-      const endpoint     = `/${collection.type}_collections/${collection.id}.json`;
+      const endpoint      = `/${collection.type}_collections/${collection.id}.json`;
       const collectionKey = collection.type === 'custom' ? 'custom_collection' : 'smart_collection';
 
       if (needsConvert) {
         console.log(`   Downloading (${sizeKB}KB)...`);
-        const buffer    = await downloadImage(img.src);
-        const webpBuf   = await convertToWebP(buffer, alt);
-        const newSizeKB = Math.round(webpBuf.length / 1024);
+        const buffer      = await downloadImage(img.src);
+        const webpBuf     = await convertToWebP(buffer, alt);
+        const newSizeKB   = Math.round(webpBuf.length / 1024);
         const newFilename = generateCollectionFilename(collection.title);
 
         console.log(`   Compressed: ${sizeKB}KB → ${newSizeKB}KB`);
@@ -651,20 +493,9 @@ async function runTechnicalSEO() {
   console.log('\n🚀 Nova Mart Technical SEO Optimizer');
   console.log('='.repeat(60));
 
-  loadDailyCalls();
-
-  // Groq key verification — does NOT count against daily limit
-  try {
-    await groq.chat.completions.create({
-      model: GROQ_MODEL,
-      messages: [{ role: 'user', content: 'Reply with OK' }],
-      max_tokens: 5,
-    });
-    console.log('   ✅ Groq API key verified');
-  } catch (e) {
-    console.error('   ❌ Groq key invalid:', e.message);
-    process.exit(1);
-  }
+  // Verify all AI keys via apiManager
+  await verifyAllKeys();
+  console.log(getStatus());
 
   const progress = loadProgress();
   console.log(`\n📂 Progress — Products done: ${progress.completedProducts.length} | Collections done: ${progress.completedCollections.length}`);
@@ -677,7 +508,7 @@ async function runTechnicalSEO() {
   let totalConverted = 0, totalAltOnly = 0, totalErrors = 0, totalSkipped = 0;
 
   for (const product of products) {
-    // Progress skip — already fully processed
+    // Skip already fully processed products
     if (progress.completedProducts.includes(product.id)) {
       totalSkipped++;
       continue;
@@ -685,9 +516,8 @@ async function runTechnicalSEO() {
 
     // Quick check: does any image still need work?
     // Fully optimized = WebP + non-numeric filename + has alt + has title
-    // (oversized WebP still caught per-image via HEAD request during processing)
     const needsWork = product.images?.some(img => {
-      const fn      = img.src.split('/').pop().split('?')[0].toLowerCase();
+      const fn        = img.src.split('/').pop().split('?')[0].toLowerCase();
       const isWebP    = fn.endsWith('.webp');
       const isNumeric = /^[0-9]+\.(jpg|png|jpeg|webp)$/.test(fn);
       const hasAlt    = !!img.alt?.trim();
@@ -709,16 +539,10 @@ async function runTechnicalSEO() {
     totalAltOnly   += stats.altOnly;
     totalErrors    += stats.errors;
 
-    // Mark product complete so re-runs skip it
     progress.completedProducts.push(product.id);
     saveProgress(progress);
 
-    console.log(`   📊 Groq calls: ${totalCallsToday}/${DAILY_LIMIT}`);
-
-    if (totalCallsToday >= DAILY_LIMIT) {
-      console.log('\n⚠️  Groq daily limit reached — stopping for today. Resume tomorrow.');
-      break;
-    }
+    console.log(`   📊 ${getStatus()}`);
   }
 
   // ── STEP 2: Collections ───────────────────────────────────────────────
@@ -726,7 +550,7 @@ async function runTechnicalSEO() {
 
   console.log('\n' + '='.repeat(60));
   console.log('✅ TECHNICAL SEO COMPLETE');
-  console.log(`📊 Groq calls used   : ${totalCallsToday}/${DAILY_LIMIT}`);
+  console.log(`📊 ${getStatus()}`);
   console.log(`🖼️  Images converted  : ${totalConverted}`);
   console.log(`✍️  Alt+Title only    : ${totalAltOnly}`);
   console.log(`⏭️  Skipped           : ${totalSkipped}`);

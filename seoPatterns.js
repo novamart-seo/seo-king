@@ -870,7 +870,14 @@ async function main() {
   console.log('='.repeat(55));
 }
 
-main().catch(err => {
-  console.error('❌ seoPatterns crashed:', err.message);
-  process.exit(1);
-});
+// ─── Export for pollAndFix.js ──────────────────────────────────────────────
+// When required as a module, applyPatterns is available directly.
+// When run directly (node seoPatterns.js), main() runs as normal.
+if (require.main === module) {
+  main().catch(err => {
+    console.error('❌ seoPatterns crashed:', err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { applyPatterns };

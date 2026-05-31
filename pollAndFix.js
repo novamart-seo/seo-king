@@ -2,32 +2,36 @@
  * pollAndFix.js
  * Runs every 30 mins via GitHub Actions.
  * Fetches products created in the last 35 mins (5 min overlap buffer).
- * Calls instantSeoFix() on each → pushes fixes to Shopify → saves report.
+ * Calls applyPatterns() from seoPatterns.js on each new product.
  */
 
 require('dotenv').config();
-const axios = require('axios');
-const { instantSeoFix } = require('./instantSeoFix');
 
-const SHOPIFY_STORE_URL    = process.env.SHOPIFY_STORE_URL;
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const axios = require('axios');
+const { applyPatterns } = require('./seoPatterns');
+
+const STORE = (process.env.SHOPIFY_STORE_URL || process.env.SHOPIFY_STORE || '')
+  .replace('https://', '').replace(/\/$/, '');
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+
+const shopify = axios.create({
+  baseURL: `https://${STORE}/admin/api/2024-01`,
+  headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' },
+});
 
 // ─── Fetch products created in last N minutes ─────────────────────────────
 async function fetchRecentProducts(minutesAgo = 35) {
   const since = new Date(Date.now() - minutesAgo * 60 * 1000).toISOString();
   console.log(`🔎 Checking products created since: ${since}`);
 
-  const { data } = await axios.get(
-    `${SHOPIFY_STORE_URL}/admin/api/2024-01/products.json`,
-    {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN },
-      params: {
-        created_at_min: since,
-        limit:          250,
-        fields:         'id,title,created_at',
-      },
-    }
-  );
+  const { data } = await shopify.get('/products.json', {
+    params: {
+      created_at_min: since,
+      limit:          250,
+      status:         'active',
+      fields:         'id,title,handle,body_html,tags,images,variants,product_type,created_at',
+    },
+  });
 
   return data.products || [];
 }
@@ -59,8 +63,8 @@ async function main() {
     console.log(`\n${'─'.repeat(50)}`);
     console.log(`🔧 Fixing: [${product.id}] ${product.title}`);
     try {
-      const result = await instantSeoFix(product.id, 'shopify');
-      results.push({ product_id: product.id, title: product.title, status: 'success', result });
+      const success = await applyPatterns(product);
+      results.push({ product_id: product.id, title: product.title, status: success ? 'success' : 'failed' });
     } catch (err) {
       console.error(`❌ Failed [${product.id}]: ${err.message}`);
       results.push({ product_id: product.id, title: product.title, status: 'failed', error: err.message });
@@ -79,7 +83,7 @@ async function main() {
 
   if (failed > 0) {
     results.filter(r => r.status === 'failed')
-           .forEach(r => console.log(`   → [${r.product_id}] ${r.title}: ${r.error}`));
+           .forEach(r => console.log(`   → [${r.product_id}] ${r.title}: ${r.error || 'AI generation failed'}`));
     process.exit(1);
   }
 }
