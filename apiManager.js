@@ -415,7 +415,7 @@ async function callOpenRouterKey(keyState, prompt, jsonMode = false, retries = 4
         headers: {
           'Authorization': `Bearer ${keyState.value}`,
           'Content-Type':  'application/json',
-          'HTTP-Referer':  'https://github.com/novamart-seo/seo-king',
+          'HTTP-Referer':  'https://novamart.pk',
           'X-Title':       'Nova Mart SEO King',
         },
         timeout: 60000,
@@ -659,7 +659,7 @@ async function verifyAllKeys() {
     if (ks.exhausted) { console.log(`   ⚠️  ${ks.label} — already exhausted`); continue; }
     if (ks.callsToday > 0) { console.log(`   ✅ ${ks.label} — active (${ks.callsToday} calls today)`); continue; }
     try {
-      await axios.post(CONFIG.openrouter.baseUrl, {
+      const res = await axios.post(CONFIG.openrouter.baseUrl, {
         model:      CONFIG.openrouter.model,
         messages:   [{ role: 'user', content: 'Reply OK' }],
         max_tokens: 5,
@@ -667,23 +667,31 @@ async function verifyAllKeys() {
         headers: {
           'Authorization': `Bearer ${ks.value}`,
           'Content-Type':  'application/json',
-          'HTTP-Referer':  'https://github.com/novamart-seo/seo-king',
+          'HTTP-Referer':  'https://novamart.pk',
           'X-Title':       'Nova Mart SEO King',
         },
-        timeout: 15000,
+        timeout: 30000,
       });
-      ks.callsToday++;
-      saveCallLog();
-      console.log(`   ✅ ${ks.label} verified`);
+      // Check response has valid content
+      if (res.data?.choices?.[0]?.message?.content) {
+        ks.callsToday++;
+        saveCallLog();
+        console.log(`   ✅ ${ks.label} verified`);
+      } else {
+        console.log(`   ⚠️  ${ks.label} — unexpected response — keeping active`);
+      }
     } catch (err) {
       const status = err.response?.status || 0;
       const msg    = (err.message || '').toLowerCase();
-      if (status === 401 || isInvalidKey(msg)) {
+      const body   = JSON.stringify(err.response?.data || '').toLowerCase();
+      if (status === 401 || isInvalidKey(msg) || isInvalidKey(body)) {
         console.log(`   🛑 ${ks.label} — invalid key`);
         ks.exhausted = true;
         saveCallLog();
+      } else if (status === 429) {
+        console.log(`   ⚠️  ${ks.label} — rate limited but valid — keeping active`);
       } else {
-        console.log(`   ⚠️  ${ks.label} — temp error — keeping active`);
+        console.log(`   ⚠️  ${ks.label} — temp error (${status || msg.slice(0, 40)}) — keeping active`);
       }
     }
     await wait(300);

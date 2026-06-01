@@ -19,7 +19,8 @@ const sharp = require('sharp');
 const { callAIJson, verifyAllKeys, getStatus } = require('./apiManager');
 
 // ─── Store + Auth ──────────────────────────────────────────────────────────
-const STORE = process.env.SHOPIFY_STORE;
+const STORE = (process.env.SHOPIFY_STORE_URL || process.env.SHOPIFY_STORE || '')
+  .replace('https://', '').replace(/\/$/, '');
 const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
 // ─── Limits ────────────────────────────────────────────────────────────────
