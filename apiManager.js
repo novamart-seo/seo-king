@@ -3,16 +3,16 @@
  * Centralized AI API key rotation manager for Nova Mart SEO King.
  *
  * PROVIDERS & KEYS:
- *   Gemini  — 4 keys × 1,500 req/day  = 6,000/day
- *   Groq    — 4 keys × 14,400 req/day = 57,600/day
- *   DeepSeek— 3 keys × ~5,000 req/day = 15,000/day
- *   TOTAL   ≈ 78,600 requests/day FREE
+ *   Gemini     — 4 keys × 1,500 req/day   =   6,000/day
+ *   Groq       — 4 keys × 14,400 req/day  =  57,600/day
+ *   OpenRouter — 4 keys × 200 req/day     =     800/day  (DeepSeek V4 Flash free)
+ *   TOTAL      ≈ 64,400 requests/day FREE
  *
  * ROTATION STRATEGY:
  *   1. Gemini keys used sequentially (Key1 → Key2 → Key3 → Key4)
  *   2. Switch to next Gemini key at 90% of daily safe limit (before hitting wall)
  *   3. When ALL Gemini keys exhausted → rotate through Groq keys
- *   4. When ALL Groq keys exhausted   → rotate through DeepSeek keys
+ *   4. When ALL Groq keys exhausted   → rotate through OpenRouter keys
  *   5. Per-minute rate limits enforced per key with automatic cooldown
  *
  * USAGE:
@@ -42,14 +42,14 @@ const fs = require('fs');
 
 const CONFIG = {
   gemini: {
-    model:        'gemini-2.5-flash',
-    safeLimit:    1350,   // 90% of 1,500 — switch before hitting wall
-    rpmLimit:     13,     // 90% of 15 RPM
-    delayMs:      5000,   // min ms between calls per key
+    model:           'gemini-2.5-flash',
+    safeLimit:       1350,   // 90% of 1,500 — switch before hitting wall
+    rpmLimit:        13,     // 90% of 15 RPM
+    delayMs:         5000,   // min ms between calls per key
     maxOutputTokens: 8192,
-    temperature:  0.7,
+    temperature:     0.7,
     keys: [
-      process.env.GEMINI_API_KEY   || process.env.GEMINI_API_KEY_1,
+      process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY_1,
       process.env.GEMINI_API_KEY_2,
       process.env.GEMINI_API_KEY_3,
       process.env.GEMINI_API_KEY_4,
@@ -69,18 +69,19 @@ const CONFIG = {
       process.env.GROQ_API_KEY_4,
     ],
   },
-  deepseek: {
-    model:       'deepseek-chat',
-    safeLimit:   4500,   // 90% of ~5,000
-    rpmLimit:    54,     // 90% of 60 RPM
-    delayMs:     1200,
+  openrouter: {
+    model:       'deepseek/deepseek-v4-flash:free',  // best free model on OpenRouter
+    safeLimit:   180,    // 90% of 200 req/day per key
+    rpmLimit:    18,     // 90% of 20 RPM
+    delayMs:     3500,   // min ms between calls per key
     maxTokens:   4096,
     temperature: 0.7,
-    baseUrl:     'https://api.deepseek.com/v1/chat/completions',
+    baseUrl:     'https://openrouter.ai/api/v1/chat/completions',
     keys: [
-      process.env.DEEPSEEK_API_KEY,
-      process.env.DEEPSEEK_API_KEY_2,
-      process.env.DEEPSEEK_API_KEY_3,
+      process.env.OPENROUTER_API_KEY,
+      process.env.OPENROUTER_API_KEY_2,
+      process.env.OPENROUTER_API_KEY_3,
+      process.env.OPENROUTER_API_KEY_4,
     ],
   },
 };
@@ -105,9 +106,9 @@ function makeKeyState(keyValue, label) {
 }
 
 const state = {
-  gemini:   CONFIG.gemini.keys.map((k, i)   => makeKeyState(k, `Gemini-Key${i + 1}`)),
-  groq:     CONFIG.groq.keys.map((k, i)     => makeKeyState(k, `Groq-Key${i + 1}`)),
-  deepseek: CONFIG.deepseek.keys.map((k, i) => makeKeyState(k, `DeepSeek-Key${i + 1}`)),
+  gemini:     CONFIG.gemini.keys.map((k, i)     => makeKeyState(k, `Gemini-Key${i + 1}`)),
+  groq:       CONFIG.groq.keys.map((k, i)       => makeKeyState(k, `Groq-Key${i + 1}`)),
+  openrouter: CONFIG.openrouter.keys.map((k, i) => makeKeyState(k, `OpenRouter-Key${i + 1}`)),
 };
 
 // ════════════════════════════════════════════════════════════
@@ -135,12 +136,12 @@ function loadCallLog() {
               state.groq[i].exhausted = true;
           }
         });
-        // Restore deepseek counts
-        (data.deepseek || []).forEach((entry, i) => {
-          if (state.deepseek[i]) {
-            state.deepseek[i].callsToday = entry.calls || 0;
-            if (entry.exhausted || entry.calls >= CONFIG.deepseek.safeLimit)
-              state.deepseek[i].exhausted = true;
+        // Restore openrouter counts
+        (data.openrouter || []).forEach((entry, i) => {
+          if (state.openrouter[i]) {
+            state.openrouter[i].callsToday = entry.calls || 0;
+            if (entry.exhausted || entry.calls >= CONFIG.openrouter.safeLimit)
+              state.openrouter[i].exhausted = true;
           }
         });
         console.log('📊 apiManager — call log restored for today');
@@ -154,10 +155,10 @@ function loadCallLog() {
 function saveCallLog() {
   try {
     fs.writeFileSync(CALL_LOG_FILE, JSON.stringify({
-      date:     new Date().toDateString(),
-      gemini:   state.gemini.map(s   => ({ label: s.label, calls: s.callsToday, exhausted: s.exhausted })),
-      groq:     state.groq.map(s     => ({ label: s.label, calls: s.callsToday, exhausted: s.exhausted })),
-      deepseek: state.deepseek.map(s => ({ label: s.label, calls: s.callsToday, exhausted: s.exhausted })),
+      date:       new Date().toDateString(),
+      gemini:     state.gemini.map(s     => ({ label: s.label, calls: s.callsToday, exhausted: s.exhausted })),
+      groq:       state.groq.map(s       => ({ label: s.label, calls: s.callsToday, exhausted: s.exhausted })),
+      openrouter: state.openrouter.map(s => ({ label: s.label, calls: s.callsToday, exhausted: s.exhausted })),
     }, null, 2));
   } catch (e) {}
 }
@@ -373,14 +374,14 @@ async function callGroqKey(keyState, prompt, jsonMode = false, retries = 4) {
 }
 
 // ════════════════════════════════════════════════════════════
-// DEEPSEEK CALLER
+// OPENROUTER CALLER (DeepSeek V4 Flash free)
 // ════════════════════════════════════════════════════════════
 
-async function callDeepSeekKey(keyState, prompt, jsonMode = false, retries = 4) {
+async function callOpenRouterKey(keyState, prompt, jsonMode = false, retries = 4) {
   if (!keyState.value || keyState.exhausted) return null;
-  if (keyState.callsToday >= CONFIG.deepseek.safeLimit) {
+  if (keyState.callsToday >= CONFIG.openrouter.safeLimit) {
     if (!keyState.exhausted) {
-      console.log(`   ⚠️  ${keyState.label} at safe limit (${keyState.callsToday}/${CONFIG.deepseek.safeLimit}) — switching`);
+      console.log(`   ⚠️  ${keyState.label} at safe limit (${keyState.callsToday}/${CONFIG.openrouter.safeLimit}) — switching`);
       keyState.exhausted = true;
       saveCallLog();
     }
@@ -390,30 +391,32 @@ async function callDeepSeekKey(keyState, prompt, jsonMode = false, retries = 4) 
   let backoff = 12000;
 
   for (let i = 0; i < retries; i++) {
-    if (keyState.callsToday >= CONFIG.deepseek.safeLimit) {
+    if (keyState.callsToday >= CONFIG.openrouter.safeLimit) {
       keyState.exhausted = true;
       saveCallLog();
       return null;
     }
 
-    await enforceRate(keyState, CONFIG.deepseek);
+    await enforceRate(keyState, CONFIG.openrouter);
 
     try {
       keyState.rpmCount++;
       keyState.lastCall = Date.now();
 
       const body = {
-        model:       CONFIG.deepseek.model,
+        model:       CONFIG.openrouter.model,
         messages:    [{ role: 'user', content: prompt }],
-        max_tokens:  CONFIG.deepseek.maxTokens,
-        temperature: CONFIG.deepseek.temperature,
+        max_tokens:  CONFIG.openrouter.maxTokens,
+        temperature: CONFIG.openrouter.temperature,
       };
       if (jsonMode) body.response_format = { type: 'json_object' };
 
-      const res  = await axios.post(CONFIG.deepseek.baseUrl, body, {
+      const res = await axios.post(CONFIG.openrouter.baseUrl, body, {
         headers: {
           'Authorization': `Bearer ${keyState.value}`,
           'Content-Type':  'application/json',
+          'HTTP-Referer':  'https://github.com/novamart-seo/seo-king',
+          'X-Title':       'Nova Mart SEO King',
         },
         timeout: 60000,
       });
@@ -435,9 +438,9 @@ async function callDeepSeekKey(keyState, prompt, jsonMode = false, retries = 4) 
         return null;
       }
       if (isDailyQuota(msg) || status === 402) {
-        console.log(`   🛑 ${keyState.label} quota hit — switching key`);
+        console.log(`   🛑 ${keyState.label} daily quota hit — switching key`);
         keyState.exhausted = true;
-        keyState.callsToday = CONFIG.deepseek.safeLimit;
+        keyState.callsToday = CONFIG.openrouter.safeLimit;
         saveCallLog();
         return null;
       }
@@ -457,7 +460,7 @@ async function callDeepSeekKey(keyState, prompt, jsonMode = false, retries = 4) 
 }
 
 // ════════════════════════════════════════════════════════════
-// MAIN ROUTER — Gemini → Groq → DeepSeek with per-key rotation
+// MAIN ROUTER — Gemini → Groq → OpenRouter with per-key rotation
 // ════════════════════════════════════════════════════════════
 
 /**
@@ -466,7 +469,7 @@ async function callDeepSeekKey(keyState, prompt, jsonMode = false, retries = 4) 
  * Returns: { text, provider, keyLabel } or null if everything exhausted.
  */
 async function callAI(prompt, jsonMode = false) {
-  // ── Try each Gemini key in order ─────────────────────────────────────────
+  // ── Try each Gemini key in order ──────────────────────────────────────────
   for (const keyState of state.gemini) {
     if (keyState.exhausted) continue;
     console.log(`   🤖 Trying ${keyState.label} (${keyState.callsToday}/${CONFIG.gemini.safeLimit})...`);
@@ -487,14 +490,14 @@ async function callAI(prompt, jsonMode = false) {
     }
   }
 
-  // ── All Groq exhausted → try each DeepSeek key ────────────────────────────
+  // ── All Groq exhausted → try each OpenRouter key ──────────────────────────
   const groqAllExhausted = state.groq.every(k => k.exhausted);
   if (geminiAllExhausted && groqAllExhausted) {
-    for (const keyState of state.deepseek) {
+    for (const keyState of state.openrouter) {
       if (keyState.exhausted) continue;
-      console.log(`   🔄 Groq exhausted — trying ${keyState.label} (${keyState.callsToday}/${CONFIG.deepseek.safeLimit})...`);
-      const text = await callDeepSeekKey(keyState, prompt, jsonMode);
-      if (text !== null) return { text, provider: 'deepseek', keyLabel: keyState.label };
+      console.log(`   🔄 Groq exhausted — trying ${keyState.label} (${keyState.callsToday}/${CONFIG.openrouter.safeLimit})...`);
+      const text = await callOpenRouterKey(keyState, prompt, jsonMode);
+      if (text !== null) return { text, provider: 'openrouter', keyLabel: keyState.label };
       if (!keyState.exhausted) return null;
     }
   }
@@ -553,21 +556,21 @@ function getStatus() {
   for (const ks of state.gemini) {
     const pct  = Math.round((ks.callsToday / CONFIG.gemini.safeLimit) * 100);
     const flag = ks.exhausted ? '🛑' : pct >= 80 ? '⚠️ ' : '✅';
-    lines.push(`   ${flag} ${ks.label.padEnd(14)} ${String(ks.callsToday).padStart(4)}/${CONFIG.gemini.safeLimit}  (${pct}%)${!ks.value ? '  [not set]' : ''}`);
+    lines.push(`   ${flag} ${ks.label.padEnd(18)} ${String(ks.callsToday).padStart(4)}/${CONFIG.gemini.safeLimit}   (${pct}%)${!ks.value ? '  [not set]' : ''}`);
   }
   for (const ks of state.groq) {
     const pct  = Math.round((ks.callsToday / CONFIG.groq.safeLimit) * 100);
     const flag = ks.exhausted ? '🛑' : pct >= 80 ? '⚠️ ' : '✅';
-    lines.push(`   ${flag} ${ks.label.padEnd(14)} ${String(ks.callsToday).padStart(5)}/${CONFIG.groq.safeLimit}  (${pct}%)${!ks.value ? '  [not set]' : ''}`);
+    lines.push(`   ${flag} ${ks.label.padEnd(18)} ${String(ks.callsToday).padStart(5)}/${CONFIG.groq.safeLimit}  (${pct}%)${!ks.value ? '  [not set]' : ''}`);
   }
-  for (const ks of state.deepseek) {
-    const pct  = Math.round((ks.callsToday / CONFIG.deepseek.safeLimit) * 100);
+  for (const ks of state.openrouter) {
+    const pct  = Math.round((ks.callsToday / CONFIG.openrouter.safeLimit) * 100);
     const flag = ks.exhausted ? '🛑' : pct >= 80 ? '⚠️ ' : '✅';
-    lines.push(`   ${flag} ${ks.label.padEnd(14)} ${String(ks.callsToday).padStart(4)}/${CONFIG.deepseek.safeLimit}  (${pct}%)${!ks.value ? '  [not set]' : ''}`);
+    lines.push(`   ${flag} ${ks.label.padEnd(18)} ${String(ks.callsToday).padStart(3)}/${CONFIG.openrouter.safeLimit}    (${pct}%)${!ks.value ? '  [not set]' : ''}`);
   }
 
   const allExhausted = [
-    ...state.gemini, ...state.groq, ...state.deepseek
+    ...state.gemini, ...state.groq, ...state.openrouter
   ].every(k => k.exhausted);
   lines.push(allExhausted ? '\n   🛑 ALL KEYS EXHAUSTED' : '\n   ✅ Keys available');
 
@@ -578,7 +581,7 @@ function getStatus() {
  * Returns true if at least one key across any provider is still usable.
  */
 function hasCapacity() {
-  return [...state.gemini, ...state.groq, ...state.deepseek].some(k => !k.exhausted && k.value);
+  return [...state.gemini, ...state.groq, ...state.openrouter].some(k => !k.exhausted && k.value);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -588,10 +591,12 @@ function hasCapacity() {
 async function verifyAllKeys() {
   console.log('\n🔑 Verifying all API keys...');
 
-  // Gemini
+  // ── Gemini ────────────────────────────────────────────────────────────────
   for (const ks of state.gemini) {
     if (!ks.value) { console.log(`   ⚠️  ${ks.label} — not configured`); continue; }
     if (ks.exhausted) { console.log(`   ⚠️  ${ks.label} — already exhausted`); continue; }
+    // Skip verify call if already proven working today
+    if (ks.callsToday > 0) { console.log(`   ✅ ${ks.label} — active (${ks.callsToday} calls today)`); continue; }
     try {
       const client = new GoogleGenerativeAI(ks.value);
       const model  = client.getGenerativeModel({ model: CONFIG.gemini.model });
@@ -616,14 +621,15 @@ async function verifyAllKeys() {
     await wait(500);
   }
 
-  // Groq
+  // ── Groq ──────────────────────────────────────────────────────────────────
   for (const ks of state.groq) {
     if (!ks.value) { console.log(`   ⚠️  ${ks.label} — not configured`); continue; }
     if (ks.exhausted) { console.log(`   ⚠️  ${ks.label} — already exhausted`); continue; }
+    if (ks.callsToday > 0) { console.log(`   ✅ ${ks.label} — active (${ks.callsToday} calls today)`); continue; }
     try {
       const client = new Groq({ apiKey: ks.value });
       await client.chat.completions.create({
-        model: CONFIG.groq.model,
+        model:    CONFIG.groq.model,
         messages: [{ role: 'user', content: 'Reply OK' }],
         max_tokens: 5,
       });
@@ -647,17 +653,23 @@ async function verifyAllKeys() {
     await wait(300);
   }
 
-  // DeepSeek
-  for (const ks of state.deepseek) {
+  // ── OpenRouter ────────────────────────────────────────────────────────────
+  for (const ks of state.openrouter) {
     if (!ks.value) { console.log(`   ⚠️  ${ks.label} — not configured`); continue; }
     if (ks.exhausted) { console.log(`   ⚠️  ${ks.label} — already exhausted`); continue; }
+    if (ks.callsToday > 0) { console.log(`   ✅ ${ks.label} — active (${ks.callsToday} calls today)`); continue; }
     try {
-      await axios.post(CONFIG.deepseek.baseUrl, {
-        model:      CONFIG.deepseek.model,
+      await axios.post(CONFIG.openrouter.baseUrl, {
+        model:      CONFIG.openrouter.model,
         messages:   [{ role: 'user', content: 'Reply OK' }],
         max_tokens: 5,
       }, {
-        headers: { Authorization: `Bearer ${ks.value}`, 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${ks.value}`,
+          'Content-Type':  'application/json',
+          'HTTP-Referer':  'https://github.com/novamart-seo/seo-king',
+          'X-Title':       'Nova Mart SEO King',
+        },
         timeout: 15000,
       });
       ks.callsToday++;
