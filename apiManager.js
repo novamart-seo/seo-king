@@ -70,7 +70,7 @@ const CONFIG = {
     ],
   },
   openrouter: {
-    model:       'deepseek/deepseek-v4-flash:free',  // best free model on OpenRouter
+    model: 'deepseek/deepseek-r1:free',  // DeepSeek R1 — confirmed free ✅
     safeLimit:   180,    // 90% of 200 req/day per key
     rpmLimit:    18,     // 90% of 20 RPM
     delayMs:     3500,   // min ms between calls per key

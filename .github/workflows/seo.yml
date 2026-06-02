@@ -66,17 +66,30 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - name: Run SEO Patterns
-        run: node seoPatterns.js
-      - name: Save progress
-        if: always()
-        uses: actions/upload-artifact@v4
+
+      # ── Restore progress.json from previous run ──────────────────────────
+      - name: Restore SEO progress
+        uses: actions/cache@v4
         with:
-          name: seo-patterns-progress-${{ github.run_id }}
           path: |
             progress.json
             api-manager-calls.json
-          retention-days: 7
+          key: seo-progress-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            seo-progress-${{ runner.os }}-
+
+      - name: Run SEO Patterns
+        run: node seoPatterns.js
+
+      # ── Save progress.json for next run ─────────────────────────────────
+      - name: Save SEO progress
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            progress.json
+            api-manager-calls.json
+          key: seo-progress-${{ runner.os }}-${{ github.run_id }}
 
   # ── Daily 2:30 AM PKT: Technical SEO (images — WebP + alt text) ───────────
   technical-seo:
@@ -92,17 +105,26 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
+
+      # ── Restore techseo-progress.json from previous run ─────────────────
+      - name: Restore Technical SEO progress
+        uses: actions/cache@v4
+        with:
+          path: techseo-progress.json
+          key: techseo-progress-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            techseo-progress-${{ runner.os }}-
+
       - name: Run Technical SEO
         run: node technicalSEO.js
-      - name: Save progress
+
+      # ── Save techseo-progress.json for next run ──────────────────────────
+      - name: Save Technical SEO progress
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: technical-seo-progress-${{ github.run_id }}
-          path: |
-            techseo-progress.json
-            api-manager-calls.json
-          retention-days: 7
+          path: techseo-progress.json
+          key: techseo-progress-${{ runner.os }}-${{ github.run_id }}
 
   # ── Wednesday 3:00 AM PKT: Collection SEO (run 1 of 2) ────────────────────
   collection-seo-wed:
@@ -116,15 +138,26 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
+
+      # ── Restore collection-progress.json from previous run ───────────────
+      - name: Restore Collection SEO progress
+        uses: actions/cache@v4
+        with:
+          path: collection-progress.json
+          key: collection-progress-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            collection-progress-${{ runner.os }}-
+
       - name: Run Collection SEO
         run: node collectionSEO.js
-      - name: Save progress
+
+      # ── Save collection-progress.json for next run ───────────────────────
+      - name: Save Collection SEO progress
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: collection-seo-wed-progress-${{ github.run_id }}
           path: collection-progress.json
-          retention-days: 7
+          key: collection-progress-${{ runner.os }}-${{ github.run_id }}
 
   # ── Saturday 3:00 AM PKT: Collection SEO (run 2 of 2) ─────────────────────
   collection-seo-sat:
@@ -138,15 +171,26 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
+
+      # ── Restore collection-progress.json from previous run ───────────────
+      - name: Restore Collection SEO progress
+        uses: actions/cache@v4
+        with:
+          path: collection-progress.json
+          key: collection-progress-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            collection-progress-${{ runner.os }}-
+
       - name: Run Collection SEO
         run: node collectionSEO.js
-      - name: Save progress
+
+      # ── Save collection-progress.json for next run ───────────────────────
+      - name: Save Collection SEO progress
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: collection-seo-sat-progress-${{ github.run_id }}
           path: collection-progress.json
-          retention-days: 7
+          key: collection-progress-${{ runner.os }}-${{ github.run_id }}
 
   # ── Daily 3:30 AM PKT: Broken links ───────────────────────────────────────
   broken-links:
