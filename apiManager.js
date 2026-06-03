@@ -3,13 +3,13 @@
  * Centralized AI API key rotation manager for Nova Mart SEO King.
  *
  * PROVIDERS & KEYS:
- *   Gemini     — 4 keys × 1,500 req/day   =   6,000/day
- *   Groq       — 4 keys × 14,400 req/day  =  57,600/day
- *   OpenRouter — 4 keys × 200 req/day     =     800/day  (DeepSeek V4 Flash free)
- *   TOTAL      ≈ 64,400 requests/day FREE
+ *   Gemini     — 6 keys × 1,500 req/day   =   9,000/day
+ *   Groq       — 6 keys × 14,400 req/day  =  86,400/day
+ *   OpenRouter — 4 keys × 200 req/day     =     800/day  (DeepSeek R1 free)
+ *   TOTAL      ≈ 96,200 requests/day FREE
  *
  * ROTATION STRATEGY:
- *   1. Gemini keys used sequentially (Key1 → Key2 → Key3 → Key4)
+ *   1. Gemini keys used sequentially (Key1 → Key2 → ... → Key6)
  *   2. Switch to next Gemini key at 90% of daily safe limit (before hitting wall)
  *   3. When ALL Gemini keys exhausted → rotate through Groq keys
  *   4. When ALL Groq keys exhausted   → rotate through OpenRouter keys
@@ -53,6 +53,8 @@ const CONFIG = {
       process.env.GEMINI_API_KEY_2,
       process.env.GEMINI_API_KEY_3,
       process.env.GEMINI_API_KEY_4,
+      process.env.GEMINI_API_KEY_5,
+      process.env.GEMINI_API_KEY_6,
     ],
   },
   groq: {
@@ -67,10 +69,12 @@ const CONFIG = {
       process.env.GROQ_API_KEY_2,
       process.env.GROQ_API_KEY_3,
       process.env.GROQ_API_KEY_4,
+      process.env.GROQ_API_KEY_5,
+      process.env.GROQ_API_KEY_6,
     ],
   },
   openrouter: {
-    model: 'deepseek/deepseek-r1:free',  // DeepSeek R1 — confirmed free ✅
+    model:       'deepseek/deepseek-r1:free',  // DeepSeek R1 — confirmed free ✅
     safeLimit:   180,    // 90% of 200 req/day per key
     rpmLimit:    18,     // 90% of 20 RPM
     delayMs:     3500,   // min ms between calls per key
@@ -120,7 +124,6 @@ function loadCallLog() {
     if (fs.existsSync(CALL_LOG_FILE)) {
       const data = JSON.parse(fs.readFileSync(CALL_LOG_FILE, 'utf8'));
       if (data.date === new Date().toDateString()) {
-        // Restore gemini counts
         (data.gemini || []).forEach((entry, i) => {
           if (state.gemini[i]) {
             state.gemini[i].callsToday = entry.calls || 0;
@@ -128,7 +131,6 @@ function loadCallLog() {
               state.gemini[i].exhausted = true;
           }
         });
-        // Restore groq counts
         (data.groq || []).forEach((entry, i) => {
           if (state.groq[i]) {
             state.groq[i].callsToday = entry.calls || 0;
@@ -136,7 +138,6 @@ function loadCallLog() {
               state.groq[i].exhausted = true;
           }
         });
-        // Restore openrouter counts
         (data.openrouter || []).forEach((entry, i) => {
           if (state.openrouter[i]) {
             state.openrouter[i].callsToday = entry.calls || 0;
@@ -197,18 +198,12 @@ function isInvalidKey(msg) {
 
 async function enforceRate(keyState, config) {
   const now = Date.now();
-
-  // Reset RPM window if > 60s
   if (now - keyState.rpmWindow > 60000) {
     keyState.rpmCount = 0;
     keyState.rpmWindow = now;
   }
-
-  // Enforce minimum delay between calls
   const gap = now - keyState.lastCall;
   if (gap < config.delayMs) await wait(config.delayMs - gap);
-
-  // Enforce RPM cap — wait out the window if needed
   if (keyState.rpmCount >= config.rpmLimit) {
     const pause = 60000 - (Date.now() - keyState.rpmWindow) + 2000;
     console.log(`   ⏳ ${keyState.label} RPM cap (${config.rpmLimit}/min) — cooling ${Math.round(pause / 1000)}s...`);
@@ -242,31 +237,24 @@ async function callGeminiKey(keyState, prompt, jsonMode = false, retries = 4) {
       saveCallLog();
       return null;
     }
-
     await enforceRate(keyState, CONFIG.gemini);
-
     try {
       keyState.rpmCount++;
       keyState.lastCall = Date.now();
-
       const genConfig = {
         maxOutputTokens: CONFIG.gemini.maxOutputTokens,
         temperature:     CONFIG.gemini.temperature,
       };
       if (jsonMode) genConfig.responseMimeType = 'application/json';
-
       const model  = client.getGenerativeModel({ model: CONFIG.gemini.model, generationConfig: genConfig });
       const result = await model.generateContent(prompt);
       const text   = result.response.text().trim();
-
       keyState.callsToday++;
       saveCallLog();
       return text;
-
     } catch (err) {
       keyState.rpmCount = Math.max(0, keyState.rpmCount - 1);
       const msg = (err.message || '').toLowerCase();
-
       if (isDailyQuota(msg)) {
         console.log(`   🛑 ${keyState.label} DAILY quota hit — switching key`);
         keyState.exhausted = true;
@@ -319,13 +307,10 @@ async function callGroqKey(keyState, prompt, jsonMode = false, retries = 4) {
       saveCallLog();
       return null;
     }
-
     await enforceRate(keyState, CONFIG.groq);
-
     try {
       keyState.rpmCount++;
       keyState.lastCall = Date.now();
-
       const options = {
         model:       CONFIG.groq.model,
         messages:    [{ role: 'user', content: prompt }],
@@ -333,18 +318,14 @@ async function callGroqKey(keyState, prompt, jsonMode = false, retries = 4) {
         temperature: CONFIG.groq.temperature,
       };
       if (jsonMode) options.response_format = { type: 'json_object' };
-
       const res  = await client.chat.completions.create(options);
       const text = res.choices[0].message.content.trim();
-
       keyState.callsToday++;
       saveCallLog();
       return text;
-
     } catch (err) {
       keyState.rpmCount = Math.max(0, keyState.rpmCount - 1);
       const msg = (err.message || '').toLowerCase();
-
       if (isDailyQuota(msg)) {
         console.log(`   🛑 ${keyState.label} DAILY quota hit — switching key`);
         keyState.exhausted = true;
@@ -374,7 +355,7 @@ async function callGroqKey(keyState, prompt, jsonMode = false, retries = 4) {
 }
 
 // ════════════════════════════════════════════════════════════
-// OPENROUTER CALLER (DeepSeek V4 Flash free)
+// OPENROUTER CALLER (DeepSeek R1 free)
 // ════════════════════════════════════════════════════════════
 
 async function callOpenRouterKey(keyState, prompt, jsonMode = false, retries = 4) {
@@ -396,13 +377,10 @@ async function callOpenRouterKey(keyState, prompt, jsonMode = false, retries = 4
       saveCallLog();
       return null;
     }
-
     await enforceRate(keyState, CONFIG.openrouter);
-
     try {
       keyState.rpmCount++;
       keyState.lastCall = Date.now();
-
       const body = {
         model:       CONFIG.openrouter.model,
         messages:    [{ role: 'user', content: prompt }],
@@ -410,7 +388,6 @@ async function callOpenRouterKey(keyState, prompt, jsonMode = false, retries = 4
         temperature: CONFIG.openrouter.temperature,
       };
       if (jsonMode) body.response_format = { type: 'json_object' };
-
       const res = await axios.post(CONFIG.openrouter.baseUrl, body, {
         headers: {
           'Authorization': `Bearer ${keyState.value}`,
@@ -421,16 +398,13 @@ async function callOpenRouterKey(keyState, prompt, jsonMode = false, retries = 4
         timeout: 60000,
       });
       const text = res.data.choices[0].message.content.trim();
-
       keyState.callsToday++;
       saveCallLog();
       return text;
-
     } catch (err) {
       keyState.rpmCount = Math.max(0, keyState.rpmCount - 1);
       const status = err.response?.status || 0;
       const msg    = (err.message || '').toLowerCase();
-
       if (status === 401 || isInvalidKey(msg)) {
         console.log(`   🛑 ${keyState.label} invalid key`);
         keyState.exhausted = true;
@@ -463,22 +437,15 @@ async function callOpenRouterKey(keyState, prompt, jsonMode = false, retries = 4
 // MAIN ROUTER — Gemini → Groq → OpenRouter with per-key rotation
 // ════════════════════════════════════════════════════════════
 
-/**
- * callAI(prompt, jsonMode?)
- * Routes through all providers and keys automatically.
- * Returns: { text, provider, keyLabel } or null if everything exhausted.
- */
 async function callAI(prompt, jsonMode = false) {
-  // ── Try each Gemini key in order ──────────────────────────────────────────
   for (const keyState of state.gemini) {
     if (keyState.exhausted) continue;
     console.log(`   🤖 Trying ${keyState.label} (${keyState.callsToday}/${CONFIG.gemini.safeLimit})...`);
     const text = await callGeminiKey(keyState, prompt, jsonMode);
     if (text !== null) return { text, provider: 'gemini', keyLabel: keyState.label };
-    if (!keyState.exhausted) return null; // temporary failure, not exhausted
+    if (!keyState.exhausted) return null;
   }
 
-  // ── All Gemini exhausted → try each Groq key ──────────────────────────────
   const geminiAllExhausted = state.gemini.every(k => k.exhausted);
   if (geminiAllExhausted) {
     for (const keyState of state.groq) {
@@ -490,7 +457,6 @@ async function callAI(prompt, jsonMode = false) {
     }
   }
 
-  // ── All Groq exhausted → try each OpenRouter key ──────────────────────────
   const groqAllExhausted = state.groq.every(k => k.exhausted);
   if (geminiAllExhausted && groqAllExhausted) {
     for (const keyState of state.openrouter) {
@@ -507,36 +473,25 @@ async function callAI(prompt, jsonMode = false) {
 }
 
 // ════════════════════════════════════════════════════════════
-// JSON HELPER — auto-parses JSON from any provider
+// JSON HELPER
 // ════════════════════════════════════════════════════════════
 
-/**
- * callAIJson(prompt)
- * Same as callAI but returns { data (parsed object), provider, keyLabel }
- * Strips markdown fences and recovers partial JSON automatically.
- */
 async function callAIJson(prompt) {
   const result = await callAI(prompt, true);
   if (!result) return null;
-
   try {
     let clean = result.text
       .replace(/^```json\s*/gi, '')
       .replace(/^```\s*/gi, '')
       .replace(/```\s*$/gi, '')
       .trim();
-
-    // Find the outermost JSON object
     const start = clean.indexOf('{');
     const end   = clean.lastIndexOf('}');
     if (start !== -1 && end !== -1) clean = clean.slice(start, end + 1);
-
-    // Attempt recovery if truncated
     if (!clean.endsWith('}')) {
       clean = clean.replace(/,?\s*"[^"]*"?\s*:\s*"[^"]*$/, '')
                    .replace(/,\s*$/, '') + '\n}';
     }
-
     const data = JSON.parse(clean);
     return { data, provider: result.provider, keyLabel: result.keyLabel };
   } catch (e) {
@@ -552,7 +507,6 @@ async function callAIJson(prompt) {
 
 function getStatus() {
   const lines = ['\n📊 API Manager Status:'];
-
   for (const ks of state.gemini) {
     const pct  = Math.round((ks.callsToday / CONFIG.gemini.safeLimit) * 100);
     const flag = ks.exhausted ? '🛑' : pct >= 80 ? '⚠️ ' : '✅';
@@ -568,18 +522,11 @@ function getStatus() {
     const flag = ks.exhausted ? '🛑' : pct >= 80 ? '⚠️ ' : '✅';
     lines.push(`   ${flag} ${ks.label.padEnd(18)} ${String(ks.callsToday).padStart(3)}/${CONFIG.openrouter.safeLimit}    (${pct}%)${!ks.value ? '  [not set]' : ''}`);
   }
-
-  const allExhausted = [
-    ...state.gemini, ...state.groq, ...state.openrouter
-  ].every(k => k.exhausted);
+  const allExhausted = [...state.gemini, ...state.groq, ...state.openrouter].every(k => k.exhausted);
   lines.push(allExhausted ? '\n   🛑 ALL KEYS EXHAUSTED' : '\n   ✅ Keys available');
-
   return lines.join('\n');
 }
 
-/**
- * Returns true if at least one key across any provider is still usable.
- */
 function hasCapacity() {
   return [...state.gemini, ...state.groq, ...state.openrouter].some(k => !k.exhausted && k.value);
 }
@@ -591,11 +538,9 @@ function hasCapacity() {
 async function verifyAllKeys() {
   console.log('\n🔑 Verifying all API keys...');
 
-  // ── Gemini ────────────────────────────────────────────────────────────────
   for (const ks of state.gemini) {
     if (!ks.value) { console.log(`   ⚠️  ${ks.label} — not configured`); continue; }
     if (ks.exhausted) { console.log(`   ⚠️  ${ks.label} — already exhausted`); continue; }
-    // Skip verify call if already proven working today
     if (ks.callsToday > 0) { console.log(`   ✅ ${ks.label} — active (${ks.callsToday} calls today)`); continue; }
     try {
       const client = new GoogleGenerativeAI(ks.value);
@@ -608,12 +553,10 @@ async function verifyAllKeys() {
       const msg = (err.message || '').toLowerCase();
       if (isDailyQuota(msg)) {
         console.log(`   🛑 ${ks.label} — daily quota already hit`);
-        ks.exhausted = true;
-        saveCallLog();
+        ks.exhausted = true; saveCallLog();
       } else if (isInvalidKey(msg)) {
         console.log(`   🛑 ${ks.label} — invalid key`);
-        ks.exhausted = true;
-        saveCallLog();
+        ks.exhausted = true; saveCallLog();
       } else {
         console.log(`   ⚠️  ${ks.label} — temp error (${msg.slice(0, 50)}) — keeping active`);
       }
@@ -621,7 +564,6 @@ async function verifyAllKeys() {
     await wait(500);
   }
 
-  // ── Groq ──────────────────────────────────────────────────────────────────
   for (const ks of state.groq) {
     if (!ks.value) { console.log(`   ⚠️  ${ks.label} — not configured`); continue; }
     if (ks.exhausted) { console.log(`   ⚠️  ${ks.label} — already exhausted`); continue; }
@@ -629,7 +571,7 @@ async function verifyAllKeys() {
     try {
       const client = new Groq({ apiKey: ks.value });
       await client.chat.completions.create({
-        model:    CONFIG.groq.model,
+        model: CONFIG.groq.model,
         messages: [{ role: 'user', content: 'Reply OK' }],
         max_tokens: 5,
       });
@@ -640,12 +582,10 @@ async function verifyAllKeys() {
       const msg = (err.message || '').toLowerCase();
       if (isDailyQuota(msg)) {
         console.log(`   🛑 ${ks.label} — daily quota already hit`);
-        ks.exhausted = true;
-        saveCallLog();
+        ks.exhausted = true; saveCallLog();
       } else if (isInvalidKey(msg)) {
         console.log(`   🛑 ${ks.label} — invalid key`);
-        ks.exhausted = true;
-        saveCallLog();
+        ks.exhausted = true; saveCallLog();
       } else {
         console.log(`   ⚠️  ${ks.label} — temp error — keeping active`);
       }
@@ -653,15 +593,14 @@ async function verifyAllKeys() {
     await wait(300);
   }
 
-  // ── OpenRouter ────────────────────────────────────────────────────────────
   for (const ks of state.openrouter) {
     if (!ks.value) { console.log(`   ⚠️  ${ks.label} — not configured`); continue; }
     if (ks.exhausted) { console.log(`   ⚠️  ${ks.label} — already exhausted`); continue; }
     if (ks.callsToday > 0) { console.log(`   ✅ ${ks.label} — active (${ks.callsToday} calls today)`); continue; }
     try {
       const res = await axios.post(CONFIG.openrouter.baseUrl, {
-        model:      CONFIG.openrouter.model,
-        messages:   [{ role: 'user', content: 'Reply OK' }],
+        model:    CONFIG.openrouter.model,
+        messages: [{ role: 'user', content: 'Reply OK' }],
         max_tokens: 5,
       }, {
         headers: {
@@ -672,7 +611,6 @@ async function verifyAllKeys() {
         },
         timeout: 30000,
       });
-      // Check response has valid content
       if (res.data?.choices?.[0]?.message?.content) {
         ks.callsToday++;
         saveCallLog();
@@ -686,8 +624,7 @@ async function verifyAllKeys() {
       const body   = JSON.stringify(err.response?.data || '').toLowerCase();
       if (status === 401 || isInvalidKey(msg) || isInvalidKey(body)) {
         console.log(`   🛑 ${ks.label} — invalid key`);
-        ks.exhausted = true;
-        saveCallLog();
+        ks.exhausted = true; saveCallLog();
       } else if (status === 429) {
         console.log(`   ⚠️  ${ks.label} — rate limited but valid — keeping active`);
       } else {
@@ -706,7 +643,7 @@ async function verifyAllKeys() {
 }
 
 // ════════════════════════════════════════════════════════════
-// INIT — load call log on require
+// INIT
 // ════════════════════════════════════════════════════════════
 
 loadCallLog();
@@ -716,9 +653,9 @@ loadCallLog();
 // ════════════════════════════════════════════════════════════
 
 module.exports = {
-  callAI,          // callAI(prompt, jsonMode?) → { text, provider, keyLabel } | null
-  callAIJson,      // callAIJson(prompt)        → { data, provider, keyLabel } | null
-  getStatus,       // getStatus()               → formatted string
-  hasCapacity,     // hasCapacity()             → boolean
-  verifyAllKeys,   // verifyAllKeys()           → Promise<void>
+  callAI,
+  callAIJson,
+  getStatus,
+  hasCapacity,
+  verifyAllKeys,
 };
