@@ -2,13 +2,14 @@
  * brokenLinks.js
  * Checks all product, collection, and page URLs for Nova Mart.
  *
- * FIXES OVER PREVIOUS VERSION:
- *  - Smart collections included (was missing before)
- *  - maxRedirects: 0 so 301/302 are actually detected (not silently followed)
- *  - Concurrency — checks 5 URLs at a time (was fully sequential)
- *  - Results saved to broken-links-report.json for GitHub Actions artifacts
+ * FIXES:
+ *  - SHOPIFY_STORE_URL fallback added (fixes EAI_AGAIN crash)
+ *  - Smart collections included
+ *  - maxRedirects: 0 so 301/302 are detected (not silently followed)
+ *  - Concurrency — checks 5 URLs at a time
+ *  - Results saved to broken-links-report.json
  *  - Error types categorised: 404, redirect, timeout, other
- *  - Active products only (status=active)
+ *  - Active products only
  */
 
 require('dotenv').config();
@@ -16,13 +17,15 @@ require('dotenv').config();
 const axios = require('axios');
 const fs    = require('fs');
 
-const STORE    = process.env.SHOPIFY_STORE;
+// ── FIX: use SHOPIFY_STORE_URL with fallback ──────────────────────────────
+const STORE    = (process.env.SHOPIFY_STORE_URL || process.env.SHOPIFY_STORE || '')
+  .replace('https://', '').replace(/\/$/, '');
 const TOKEN    = process.env.SHOPIFY_ACCESS_TOKEN;
-const SITE_URL = 'https://mynovamart.store';
+const SITE_URL = `https://${STORE.replace('.myshopify.com', '')}`;
 
 const CONCURRENCY  = 5;
 const TIMEOUT_MS   = 10000;
-const DELAY_MS     = 200;   // between batches
+const DELAY_MS     = 200;
 const REPORT_FILE  = './broken-links-report.json';
 
 const shopify = axios.create({
@@ -59,33 +62,25 @@ async function checkURL(item, retries = 2) {
     try {
       const response = await axios.get(item.url, {
         timeout: TIMEOUT_MS,
-        maxRedirects: 0,          // Don't follow — detect 301/302 directly
-        validateStatus: s => s < 400 || s === 301 || s === 302,  // don't throw on redirects
+        maxRedirects: 0,
+        validateStatus: s => s < 400 || s === 301 || s === 302,
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SEO-King-Bot/1.0)' }
       });
 
       const status = response.status;
-
       if (status === 301 || status === 302) {
         const location = response.headers['location'] || '';
         return { ...item, status, type: 'redirect', location };
       }
-
       return { ...item, status, type: 'ok' };
 
     } catch (error) {
       const status = error.response?.status || 0;
-
-      // 404 is definitive — no retry needed
       if (status === 404) return { ...item, status, type: 'broken' };
-
-      // Timeout or network error — retry once
       if (i < retries - 1) { await wait(2000); continue; }
-
       const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
       return {
-        ...item,
-        status,
+        ...item, status,
         type:  isTimeout ? 'timeout' : 'error',
         error: error.message,
       };
@@ -113,24 +108,16 @@ async function getProductURLs() {
 async function getCollectionURLs() {
   const collections = [];
 
-  // Custom collections
-  let url = '/custom_collections.json?limit=250&fields=id,title,handle';
-  while (url) {
-    const res = await shopify.get(url);
-    collections.push(...res.data.custom_collections.map(c => ({ ...c, _kind: 'custom' })));
-    const link = res.headers['link'] || '';
-    const next = link.match(/<([^>]+)>;\s*rel="next"/);
-    url = next ? next[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
-  }
-
-  // Smart collections (was missing before)
-  url = '/smart_collections.json?limit=250&fields=id,title,handle';
-  while (url) {
-    const res = await shopify.get(url);
-    collections.push(...res.data.smart_collections.map(c => ({ ...c, _kind: 'smart' })));
-    const link = res.headers['link'] || '';
-    const next = link.match(/<([^>]+)>;\s*rel="next"/);
-    url = next ? next[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
+  for (const type of ['custom', 'smart']) {
+    let url = `/${type}_collections.json?limit=250&fields=id,title,handle`;
+    while (url) {
+      const res = await shopify.get(url);
+      const key = type === 'custom' ? 'custom_collections' : 'smart_collections';
+      collections.push(...res.data[key].map(c => ({ ...c, _kind: type })));
+      const link = res.headers['link'] || '';
+      const next = link.match(/<([^>]+)>;\s*rel="next"/);
+      url = next ? next[1].replace(`https://${STORE}/admin/api/2024-01`, '') : null;
+    }
   }
 
   return collections.map(c => ({
@@ -152,6 +139,7 @@ async function getPageURLs() {
 
 async function runBrokenLinkChecker() {
   console.log('\n🔍 Nova Mart — Broken Link Checker');
+  console.log(`   Store: ${STORE}`);
   console.log('='.repeat(55));
 
   console.log('\nGathering all URLs...');
@@ -173,7 +161,6 @@ async function runBrokenLinkChecker() {
   const limiter  = new ConcurrencyLimit(CONCURRENCY);
   let checked    = 0;
 
-  // Process in batches with concurrency
   const checks = allURLs.map(item =>
     limiter.run(async () => {
       const result = await checkURL(item);
@@ -204,7 +191,7 @@ async function runBrokenLinkChecker() {
 
   await Promise.all(checks);
 
-  // ── Summary ──────────────────────────────────────────────────────────
+  // ── Summary ───────────────────────────────────────────────────────────
   console.log('\n' + '='.repeat(55));
   console.log('📊 BROKEN LINK REPORT');
   console.log('='.repeat(55));
@@ -235,7 +222,7 @@ async function runBrokenLinkChecker() {
 
   // ── Save report ───────────────────────────────────────────────────────
   const report = {
-    date:      new Date().toISOString(),
+    date:    new Date().toISOString(),
     summary: {
       total:     allURLs.length,
       ok:        results.ok.length,

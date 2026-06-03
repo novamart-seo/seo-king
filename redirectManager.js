@@ -24,7 +24,8 @@ require('dotenv').config();
 const axios = require('axios');
 const fs    = require('fs');
 
-const STORE = process.env.SHOPIFY_STORE;
+const STORE = (process.env.SHOPIFY_STORE_URL || process.env.SHOPIFY_STORE || '')
+  .replace('https://', '').replace(/\/$/, '');
 const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
 const SNAPSHOT_FILE = './url-snapshot.json';
